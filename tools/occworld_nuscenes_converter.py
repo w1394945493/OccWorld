@@ -8,6 +8,8 @@ from typing import List, Tuple, Union
 
 import mmcv
 import numpy as np
+from mmengine import dump, load
+from mmengine.utils import mkdir_or_exist, track_iter_progress
 from pyquaternion import Quaternion
 from nuscenes.nuscenes import NuScenes
 from nuscenes.utils.data_classes import Box
@@ -250,13 +252,13 @@ def create_nuscenes_infos(root_path,
     metadata = dict(version=version)
     print('train scenes: {}, val scenes: {}'.format(
         len(train_nusc_infos), len(val_nusc_infos)))
-    mmcv.mkdir_or_exist(out_path)
+    mkdir_or_exist(out_path)
     train_path = osp.join(
         out_path, f'{info_prefix}_infos_train_temporal_v3_scene.pkl')
     val_path = osp.join(
         out_path, f'{info_prefix}_infos_val_temporal_v3_scene.pkl')
-    mmcv.dump(dict(infos=train_nusc_infos, metadata=metadata), train_path)
-    mmcv.dump(dict(infos=val_nusc_infos, metadata=metadata), val_path)
+    dump(dict(infos=train_nusc_infos, metadata=metadata), train_path)
+    dump(dict(infos=val_nusc_infos, metadata=metadata), val_path)
     print(f'OccWorld train metadata written to {train_path}')
     print(f'OccWorld val metadata written to {val_path}')
 
@@ -292,7 +294,9 @@ def get_available_scenes(nusc):
                 # path from lyftdataset is absolute path
                 lidar_path = lidar_path.split(f'{os.getcwd()}/')[-1]
                 # relative path
-            if not mmcv.is_filepath(lidar_path):
+            #! mmcv.is_filepath 在 MMCV 2.x 中已经移除；OccWorld 环境使用
+            #! MMCV 2.x，因此直接通过标准库检查当前 LiDAR 文件是否存在。
+            if not osp.isfile(lidar_path):
                 scene_not_exist = True
                 break
             else:
@@ -364,7 +368,7 @@ def _fill_trainval_infos(nusc,
         cat2idx[dic['name']] = idx
     # *==============================================================#
     # *2. 逐个遍历 nuScenes key frame；每个 sample 最终对应 pkl 中的一条 info。
-    for sample in mmcv.track_iter_progress(nusc.sample):
+    for sample in track_iter_progress(nusc.sample):
         #! 只处理前面通过本地文件检查、且属于当前官方 train/val split 的场景。
         #! 原 VAD 写法会把“不在 train_scenes 中”的所有帧都放进 val；显式过滤可避免
         #! 局部数据集或缺失场景被错误归入 OccWorld validation metadata。
@@ -408,7 +412,9 @@ def _fill_trainval_infos(nusc,
         # *2.2 读取当前 LiDAR 文件路径、3D GT box，并匹配当前时刻的 CAN bus 状态。
         lidar_path, boxes, _ = nusc.get_sample_data(lidar_token)
 
-        mmcv.check_file_exist(lidar_path)
+        #! mmcv.check_file_exist 属于 MMCV 1.x API；这里保留相同的失败即报错语义。
+        if not osp.isfile(lidar_path):
+            raise FileNotFoundError(f'LiDAR file does not exist: {lidar_path}')
         can_bus = _get_can_bus_info(nusc, nusc_can_bus, sample)
 
         # *==============================================================#
@@ -927,7 +933,7 @@ def export_2d_annotation(root_path, info_path, version, mono3d=False):
         'CAM_BACK_LEFT',
         'CAM_BACK_RIGHT',
     ]
-    nusc_infos = mmcv.load(info_path)['infos']
+    nusc_infos = load(info_path)['infos']
     nusc = NuScenes(version=version, dataroot=root_path, verbose=True)
     # info_2d_list = []
     cat2Ids = [
@@ -937,7 +943,7 @@ def export_2d_annotation(root_path, info_path, version, mono3d=False):
     coco_ann_id = 0
     coco_2d_dict = dict(annotations=[], images=[], categories=cat2Ids)
     # *2. 遍历每帧、每个相机，将可见 3D box 投影到图像并整理为 COCO annotation。
-    for info in mmcv.track_iter_progress(nusc_infos):
+    for info in track_iter_progress(nusc_infos):
         for cam in camera_types:
             cam_info = info['cams'][cam]
             coco_infos = get_2d_boxes(
@@ -972,7 +978,7 @@ def export_2d_annotation(root_path, info_path, version, mono3d=False):
         json_prefix = f'{info_path[:-4]}_mono3d'
     else:
         json_prefix = f'{info_path[:-4]}'
-    mmcv.dump(coco_2d_dict, f'{json_prefix}.coco.json')
+    dump(coco_2d_dict, f'{json_prefix}.coco.json')
 
 
 def get_2d_boxes(nusc,
