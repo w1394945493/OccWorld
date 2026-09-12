@@ -14,7 +14,15 @@ from nuscenes.utils.data_classes import Box
 from shapely.geometry import MultiPoint, box
 from mmdet3d.datasets import NuScenesDataset
 from nuscenes.utils.geometry_utils import view_points
-from mmdet3d.core.bbox.box_np_ops import points_cam2img
+# MMDetection3D 1.x 将几何结构及投影工具由 ``mmdet3d.core`` 迁移到了
+# ``mmdet3d.structures``。OccWorld 的环境使用 MMDetection3D 1.x；保留旧路径
+# 回退是为了让该脚本仍可在 VAD 常用的 MMDetection3D 0.x 环境中运行。
+# 该函数只被下方可选的 2D COCO 标注导出逻辑使用，生成 OccWorld pkl 的
+# 主流程不会调用它，但仍须兼容导入，否则脚本会在启动时直接报错。
+try:
+    from mmdet3d.structures import points_cam2img
+except ImportError:
+    from mmdet3d.core.bbox.box_np_ops import points_cam2img
 from nuscenes.utils.geometry_utils import transform_matrix
 
 
