@@ -73,6 +73,14 @@ def locate_message(utimes, utime):
     return i
 
 
+def _get_cached_can_bus_messages(nusc_can_bus, scene_name, channel, cache):
+    """Read each scene/channel CAN bus JSON at most once."""
+    cache_key = (scene_name, channel)
+    if cache_key not in cache:
+        cache[cache_key] = nusc_can_bus.get_messages(scene_name, channel)
+    return cache[cache_key]
+
+
 def resolve_occ3d_gts_root(occ3d_root):
     """Resolve an Occ3D path to the directory that directly contains scenes."""
     occ3d_root = osp.abspath(osp.expanduser(occ3d_root))
@@ -327,12 +335,15 @@ def get_available_scenes(nusc):
     return available_scenes
 
 
-def _get_can_bus_info(nusc, nusc_can_bus, sample):
+def _get_can_bus_info(nusc, nusc_can_bus, sample, can_bus_cache):
     # *1. 使用 sample 所属 scene 名称读取该场景的 CAN bus pose 消息序列。
     scene_name = nusc.get('scene', sample['scene_token'])['name']
     sample_timestamp = sample['timestamp']
     try:
-        pose_list = nusc_can_bus.get_messages(scene_name, 'pose')
+        #! 同一 scene 的 CAN bus pose 原始 JSON 对该场景所有帧完全相同。
+        #! 缓存后只读取/解析一次，避免每一关键帧都重复访问磁盘。
+        pose_list = _get_cached_can_bus_messages(
+            nusc_can_bus, scene_name, 'pose', can_bus_cache)
     except:
         return np.zeros(18)  # server scenes do not have can bus information.
     # *2. 在有序消息中寻找时间上最接近当前 sample 的 pose；若 CAN bus 不可用则返回全零特征。
@@ -343,6 +354,8 @@ def _get_can_bus_info(nusc, nusc_can_bus, sample):
         if pose['utime'] > sample_timestamp:
             break
         last_pose = pose
+    #! 后面会 pop 若干键，因此必须复制；不能修改缓存中的原始消息。
+    last_pose = copy.deepcopy(last_pose)
     # *3. 按 BEVFormer/VAD 约定把位置、四元数和运动状态打包，并预留两个航向角槽位，共 18 维。
     _ = last_pose.pop('utime')  # useless
     pos = last_pose.pop('pos')
@@ -385,6 +398,10 @@ def _fill_trainval_infos(nusc,
     cat2idx = {}
     for idx, dic in enumerate(nusc.category):
         cat2idx[dic['name']] = idx
+    #! 性能缓存：CAN bus 文件按 scene/channel 缓存；LiDAR global pose 按
+    #! sample token 缓存。它们只复用确定性的读取/坐标变换结果，不改变 pkl 内容。
+    can_bus_cache = {}
+    global_sensor_pose_cache = {}
     # *==============================================================#
     # *2. 逐个遍历 nuScenes key frame；每个 sample 最终对应 pkl 中的一条 info。
     for sample in track_iter_progress(nusc.sample):
@@ -434,7 +451,8 @@ def _fill_trainval_infos(nusc,
         #! mmcv.check_file_exist 属于 MMCV 1.x API；这里保留相同的失败即报错语义。
         if not osp.isfile(lidar_path):
             raise FileNotFoundError(f'LiDAR file does not exist: {lidar_path}')
-        can_bus = _get_can_bus_info(nusc, nusc_can_bus, sample)
+        can_bus = _get_can_bus_info(
+            nusc, nusc_can_bus, sample, can_bus_cache)
 
         # *==============================================================#
         #* fut_valid_flag 是 VAD 额外生成的“完整未来是否可用”标志：从当前 sample 沿 next
@@ -492,7 +510,14 @@ def _fill_trainval_infos(nusc,
         ]
         for cam in camera_types:
             cam_token = sample['data'][cam]
-            cam_path, _, cam_intrinsic = nusc.get_sample_data(cam_token)
+            #! 这里只需要相机内参。nusc.get_sample_data(cam_token) 还会读取并
+            #! 变换该相机对应的所有 GT boxes，返回后却未使用，是全量转换中的
+            #! 主要冗余计算；直接从 calibrated_sensor 读取内参可得到相同结果。
+            cam_sd_record = nusc.get('sample_data', cam_token)
+            cam_cs_record = nusc.get(
+                'calibrated_sensor', cam_sd_record['calibrated_sensor_token'])
+            #! 保持与 NuScenes.get_sample_data() 返回值一致，仍保存为 ndarray。
+            cam_intrinsic = np.array(cam_cs_record['camera_intrinsic'])
             cam_info = obtain_sensor2top(nusc, cam_token, l2e_t, l2e_r_mat,
                                          e2g_t, e2g_r_mat, cam)
             cam_info.update(cam_intrinsic=cam_intrinsic)
@@ -687,13 +712,17 @@ def _fill_trainval_infos(nusc,
             sample_cur = sample
             for i in range(his_ts, -1, -1):
                 if sample_cur is not None:
-                    pose_mat = get_global_sensor_pose(sample_cur, nusc, inverse=False)
+                    pose_mat = get_global_sensor_pose(
+                        sample_cur, nusc, inverse=False,
+                        cache=global_sensor_pose_cache)
                     ego_his_trajs[i] = pose_mat[:3, 3]
                     has_prev = sample_cur['prev'] != ''
                     has_next = sample_cur['next'] != ''
                     if has_next:
                         sample_next = nusc.get('sample', sample_cur['next'])
-                        pose_mat_next = get_global_sensor_pose(sample_next, nusc, inverse=False)
+                        pose_mat_next = get_global_sensor_pose(
+                            sample_next, nusc, inverse=False,
+                            cache=global_sensor_pose_cache)
                         ego_his_trajs_diff[i] = pose_mat_next[:3, 3] - ego_his_trajs[i]
                     sample_cur = nusc.get('sample', sample_cur['prev']) if has_prev else None
                 else:
@@ -721,7 +750,9 @@ def _fill_trainval_infos(nusc,
             ego_fut_masks = np.zeros((fut_ts+1))
             sample_cur = sample
             for i in range(fut_ts+1):
-                pose_mat = get_global_sensor_pose(sample_cur, nusc, inverse=False)
+                pose_mat = get_global_sensor_pose(
+                    sample_cur, nusc, inverse=False,
+                    cache=global_sensor_pose_cache)
                 ego_fut_trajs[i] = pose_mat[:3, 3]
                 ego_fut_masks[i] = 1
                 if sample_cur['next'] == '':
@@ -786,8 +817,12 @@ def _fill_trainval_infos(nusc,
 
             ref_scene = nusc.get("scene", sample['scene_token'])
             try:
-                pose_msgs = nusc_can_bus.get_messages(ref_scene['name'],'pose')
-                steer_msgs = nusc_can_bus.get_messages(ref_scene['name'], 'steeranglefeedback')
+                #! 与 can_bus 18 维状态共用缓存，避免每帧再次解析相同 JSON。
+                pose_msgs = _get_cached_can_bus_messages(
+                    nusc_can_bus, ref_scene['name'], 'pose', can_bus_cache)
+                steer_msgs = _get_cached_can_bus_messages(
+                    nusc_can_bus, ref_scene['name'], 'steeranglefeedback',
+                    can_bus_cache)
                 pose_uts = [msg['utime'] for msg in pose_msgs]
                 steer_uts = [msg['utime'] for msg in steer_msgs]
                 ref_utime = sample['timestamp']
@@ -847,7 +882,10 @@ def _fill_trainval_infos(nusc,
 
     return train_nusc_infos, val_nusc_infos
 
-def get_global_sensor_pose(rec, nusc, inverse=False):
+def get_global_sensor_pose(rec, nusc, inverse=False, cache=None):
+    cache_key = (rec['token'], inverse)
+    if cache is not None and cache_key in cache:
+        return cache[cache_key]
     # *1. 读取指定 sample 的 LIDAR_TOP 标定和采集时刻 ego pose。
     lidar_sample_data = nusc.get('sample_data', rec['data']['LIDAR_TOP'])
 
@@ -868,6 +906,8 @@ def get_global_sensor_pose(rec, nusc, inverse=False):
         sensor_from_ego = transform_matrix(sd_cs["translation"], Quaternion(sd_cs["rotation"]), inverse=True)
         ego_from_global = transform_matrix(sd_ep["translation"], Quaternion(sd_ep["rotation"]), inverse=True)
         pose = sensor_from_ego.dot(ego_from_global)
+    if cache is not None:
+        cache[cache_key] = pose
     return pose
 
 def obtain_sensor2top(nusc,
