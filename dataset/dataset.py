@@ -12,6 +12,7 @@ class nuScenesSceneDatasetLidar:
     def __init__(
             self, 
             data_path,
+            occ_path,
             return_len, 
             offset,
             imageset='train', 
@@ -33,6 +34,7 @@ class nuScenesSceneDatasetLidar:
         self.scene_names = list(self.nusc_infos.keys())
         self.scene_lens = [len(self.nusc_infos[sn]) for sn in self.scene_names]
         self.data_path = data_path
+        self.occ_path = occ_path
         self.return_len = return_len
         self.offset = offset
         self.nusc = nusc
@@ -59,7 +61,7 @@ class nuScenesSceneDatasetLidar:
             #! <data_path>/<gts|tpv_dense|tpv_sparse>/<scene-xxxx>/<sample_token>/labels.npz。
             #! VAD 元数据只提供 sample token，不包含 labels.npz；转换 pkl 时必须确保
             #! dict 键 scene_name 与实际 Occ3D 标签中的 'scene-xxxx' 目录名完全一致。
-            label_file = os.path.join(self.data_path, f'{self.input_dataset}/{scene_name}/{token}/labels.npz')
+            label_file = os.path.join(self.occ_path, f'{self.input_dataset}/{scene_name}/{token}/labels.npz')
             label = np.load(label_file)
             occ = label['semantics']
             occs.append(occ)
@@ -177,6 +179,7 @@ class nuScenesSceneDatasetLidarTraverse(nuScenesSceneDatasetLidar):
     def __init__(
         self,
         data_path,
+        occ_path,
         return_len,
         offset,
         imageset='train',
@@ -187,7 +190,18 @@ class nuScenesSceneDatasetLidarTraverse(nuScenesSceneDatasetLidar):
         input_dataset='gts',
         output_dataset='gts',
     ):
-        super().__init__(data_path, return_len, offset, imageset, nusc, times, test_mode, input_dataset, output_dataset)
+        super().__init__(
+            data_path,
+            occ_path, 
+            return_len,
+            offset,
+            imageset,
+            nusc,
+            times,
+            test_mode,
+            input_dataset,
+            output_dataset,
+        )
         self.scene_lens = [l - self.return_len - self.offset for l in self.scene_lens]
         self.use_valid_flag = use_valid_flag
         self.CLASSES = [
@@ -210,11 +224,11 @@ class nuScenesSceneDatasetLidarTraverse(nuScenesSceneDatasetLidar):
         self.with_velocity = True
         self.with_attr = True
         self.box_mode_3d = Box3DMode.LIDAR
-        
+
     def __len__(self):
         'Denotes the total number of samples'
         return sum(self.scene_lens)
-    
+
     def __getitem__(self, index):
         for i, scene_len in enumerate(self.scene_lens):
             if index < scene_len:
@@ -224,23 +238,25 @@ class nuScenesSceneDatasetLidarTraverse(nuScenesSceneDatasetLidar):
             else:
                 index -= scene_len
         occs = []
-        for i in range(self.return_len + self.offset):
+        for i in range(self.return_len + self.offset): # self.return_len:12
             token = self.nusc_infos[scene_name][idx + i]['token']
             #! 与父类相同，scene_name 必须是 'scene-xxxx' 一类目录名；VAD pkl 的
             #! info['scene_token'] 需要借助 nuScenes scene 表映射成该名称后再分组。
-            label_file = os.path.join(self.data_path, f'{self.input_dataset}/{scene_name}/{token}/labels.npz')
+            label_file = os.path.join(self.occ_path, f'{self.input_dataset}/{scene_name}/{token}/labels.npz')
             label = np.load(label_file)
             occ = label['semantics']
             occs.append(occ)
-        input_occs = np.stack(occs, dtype=np.int64)
+        # input_occs = np.stack(occs, dtype=np.int64)
+        input_occs = np.stack(occs).astype(np.int64, copy=False)
         occs = []
         for i in range(self.return_len + self.offset):
             token = self.nusc_infos[scene_name][idx + i]['token']
-            label_file = os.path.join(self.data_path, f'{self.output_dataset}/{scene_name}/{token}/labels.npz')
+            label_file = os.path.join(self.occ_path, f'{self.output_dataset}/{scene_name}/{token}/labels.npz')
             label = np.load(label_file)
             occ = label['semantics']
             occs.append(occ)
-        output_occs = np.stack(occs, dtype=np.int64)
+        # output_occs = np.stack(occs, dtype=np.int64)
+        output_occs = np.stack(occs).astype(np.int64, copy=False)
         metas = {}
         #! OccWorld Traverse 额外把 'scene-xxxx' 名称传给下游，用于场景级遍历和结果组织。
         metas.update(scene_name=scene_name)
@@ -252,7 +268,7 @@ class nuScenesSceneDatasetLidarTraverse(nuScenesSceneDatasetLidar):
         metas.update(self.get_image_info(scene_name,idx))
         # import pdb; pdb.set_trace()
         return input_occs[:self.return_len], output_occs[self.offset:], metas
-    
+
     def get_meta_info(self, scene_name, idx):
         """Get annotation info according to the given index.
 
@@ -293,7 +309,7 @@ class nuScenesSceneDatasetLidarTraverse(nuScenesSceneDatasetLidar):
             nan_mask = np.isnan(gt_velocity[:, 0])
             gt_velocity[nan_mask] = [0.0, 0.0]
             gt_bboxes_3d = np.concatenate([gt_bboxes_3d, gt_velocity], axis=-1)
-        
+
         if self.with_attr:
             gt_fut_trajs = info['gt_agent_fut_trajs'][mask]
             gt_fut_masks = info['gt_agent_fut_masks'][mask]
@@ -303,25 +319,23 @@ class nuScenesSceneDatasetLidarTraverse(nuScenesSceneDatasetLidar):
             attr_labels = np.concatenate(
                 [gt_fut_trajs, gt_fut_masks, gt_fut_goal[..., None], gt_lcf_feat, gt_fut_yaw], axis=-1
             ).astype(np.float32)
-        
+
         # the nuscenes box center is [0.5, 0.5, 0.5], we change it to be
         # the same as KITTI (0.5, 0.5, 0)
         gt_bboxes_3d = LiDARInstance3DBoxes(
             gt_bboxes_3d,
             box_dim=gt_bboxes_3d.shape[-1],
             origin=(0.5, 0.5, 0.5)).convert_to(self.box_mode_3d)
-        
+
         anns_results = dict(
             gt_bboxes_3d=gt_bboxes_3d,
             #gt_labels_3d=gt_labels_3d,
             gt_names=gt_names_3d,
             attr_labels=attr_labels,
             fut_valid_flag=fut_valid_flag,)
-        
+
         return anns_results
-        
-        
-        
+
     def get_image_info(self, scene_name, idx):
         #! 与父类相同：固定选择窗口末帧之前第 6 帧作为相机与位姿参考帧。
         T = 6
@@ -340,7 +354,7 @@ class nuScenesSceneDatasetLidarTraverse(nuScenesSceneDatasetLidar):
         cam_intrinsics = []
         cam_positions = []
         focal_positions = []
-        
+
         lidar2ego_r = Quaternion(info['lidar2ego_rotation']).rotation_matrix
         lidar2ego = np.eye(4)
         lidar2ego[:3, :3] = lidar2ego_r
@@ -369,18 +383,14 @@ class nuScenesSceneDatasetLidarTraverse(nuScenesSceneDatasetLidar):
             ego2cam_rt = np.eye(4)
             ego2cam_rt[:3, :3] = ego2cam_r.T
             ego2cam_rt[3, :3] = -ego2cam_t
-            
-            
+
             cam_position = np.linalg.inv(ego2cam_rt.T) @ np.array([0., 0., 0., 1.]).reshape([4, 1])
             focal_position = np.linalg.inv(ego2cam_rt.T) @ np.array([0., 0., f, 1.]).reshape([4, 1])
-            #cam_position = np.linalg.inv(lidar2cam_rt.T) @ np.array([0., 0., 0., 1.]).reshape([4, 1])
+            # cam_position = np.linalg.inv(lidar2cam_rt.T) @ np.array([0., 0., 0., 1.]).reshape([4, 1])
             cam_positions.append(cam_position.flatten()[:3])
-            #focal_position = np.linalg.inv(lidar2cam_rt.T) @ np.array([0., 0., f, 1.]).reshape([4, 1])
+            # focal_position = np.linalg.inv(lidar2cam_rt.T) @ np.array([0., 0., f, 1.]).reshape([4, 1])
             focal_positions.append(focal_position.flatten()[:3])
-        
-        
-        
-        
+
         input_dict.update(
             dict(
                 img_filename=image_paths,

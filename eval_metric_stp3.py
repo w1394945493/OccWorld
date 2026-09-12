@@ -10,7 +10,11 @@ from mmengine.optim import build_optim_wrapper
 from mmengine.logging import MMLogger
 from mmengine.utils import symlink
 from mmengine.registry import MODELS
-from timm.scheduler import CosineLRScheduler, MultiStepLRScheduler
+try:
+    from timm.scheduler import CosineLRScheduler, MultiStepLRScheduler
+except ImportError:
+    from timm.scheduler import CosineLRScheduler
+
 from utils.load_save_util import revise_ckpt, revise_ckpt_1
 import warnings
 warnings.filterwarnings("ignore")
@@ -335,4 +339,3 @@ if __name__ == '__main__':
         torch.multiprocessing.spawn(main, args=(args,), nprocs=args.gpus)
     else:
         main(0, args)
-        

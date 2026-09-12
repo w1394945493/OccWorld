@@ -1,0 +1,23 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+
+        {
+            "name": "occworld val",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "/vepfs-mlp2/c20250502/haoce/wangyushen/OccWorld/eval_metric_stp3.py",
+            "args": [
+                "--py-config", "/vepfs-mlp2/c20250502/haoce/wangyushen/OccWorld/config/occworld_custom.py",
+                "--work-dir", "out/occworld",
+            ],
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "0",
+            },
+            "console": "integratedTerminal"
+        }
+    ]
+}

@@ -9,3 +9,8 @@ python tools/occworld_nuscenes_converter.py \
   --version v1.0 \
   --max-sweeps 10 \
   --min-scene-frames 16
+
+
+python eval_metric_stp3.py \
+  --py-config config/occworld.py \
+  --work-dir out/occworld
