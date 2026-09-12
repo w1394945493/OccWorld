@@ -24,7 +24,12 @@ class nuScenesSceneDatasetLidar:
         with open(imageset, 'rb') as f:
             data = pickle.load(f)
 
+        #! OccWorld 特有的 pkl 组织约定：data['infos'] 不是 VAD 的逐帧 list，而是
+        #! {scene_name: [frame_info, ...]} 形式的 dict。键通常为 'scene-0001' 等
+        #! nuScenes 场景名称，值是该场景内按时间排列的连续关键帧元数据列表。
         self.nusc_infos = data['infos']
+        #! scene_names 保存上述 dict 的场景名称键；这些名称后面还会直接用于拼接
+        #! Occ3D occupancy 标签目录，因此不能简单替换成 nuScenes scene token(UUID)。
         self.scene_names = list(self.nusc_infos.keys())
         self.scene_lens = [len(self.nusc_infos[sn]) for sn in self.scene_names]
         self.data_path = data_path
@@ -50,6 +55,10 @@ class nuScenesSceneDatasetLidar:
         occs = []
         for i in range(self.return_len + self.offset):
             token = self.nusc_infos[scene_name][idx + i]['token']
+            #! OccWorld 特有的 occupancy 数据组织：
+            #! <data_path>/<gts|tpv_dense|tpv_sparse>/<scene-xxxx>/<sample_token>/labels.npz。
+            #! VAD 元数据只提供 sample token，不包含 labels.npz；转换 pkl 时必须确保
+            #! dict 键 scene_name 与实际 Occ3D 标签中的 'scene-xxxx' 目录名完全一致。
             label_file = os.path.join(self.data_path, f'{self.input_dataset}/{scene_name}/{token}/labels.npz')
             label = np.load(label_file)
             occ = label['semantics']
@@ -58,12 +67,15 @@ class nuScenesSceneDatasetLidar:
         occs = []
         for i in range(self.return_len + self.offset):
             token = self.nusc_infos[scene_name][idx + i]['token']
+            #! output_dataset 当前被限制为 gts，用作未来 occupancy 的监督/评估目标。
             label_file = os.path.join(self.data_path, f'{self.output_dataset}/{scene_name}/{token}/labels.npz')
             label = np.load(label_file)
             occ = label['semantics']
             occs.append(occ)
         output_occs = np.stack(occs, dtype=np.int64)
         metas = {}
+        #! 注意：这里虽然命名为 scene_token，实际写入的是该场景第 5 个关键帧的
+        #! sample token，并非 nuScenes 原生的 scene token；这是 OccWorld 当前代码的接口约定。
         metas.update(scene_token=self.nusc_infos[scene_name][4]['token'])
         metas.update(self.get_meta_data(scene_name, idx))
         metas.update(self.get_image_info(scene_name,idx))
@@ -73,15 +85,23 @@ class nuScenesSceneDatasetLidar:
         return input_occs[:self.return_len], output_occs[self.offset:], metas
 
     def get_meta_data(self, scene_name, idx):
+        #! OccWorld 从连续窗口内每一帧的 VAD 风格未来轨迹中只取第 0 步，即该帧到
+        #! 下一关键帧的 (dx, dy)，再将这些单步位移组织成世界模型使用的 rel_poses。
         gt_modes = []
         xys = []
         for i in range(self.return_len + self.offset):
             xys.append(self.nusc_infos[scene_name][idx+i]['gt_ego_fut_trajs'][0]) #1*2
+            #! pose_mode 是 OccWorld 元数据额外要求的三模态驾驶/规划标签，通常为
+            #! shape=(3,) 的 one-hot；VAD converter 不生成此键，只生成 gt_ego_fut_cmd。
+            #! 使用 VAD pkl 转换时需显式补充，例如 pose_mode = gt_ego_fut_cmd，且应
+            #! 确认右转/左转/直行三个 mode 的顺序与所用 OccWorld checkpoint 一致。
             gt_modes.append(self.nusc_infos[scene_name][idx+i]['pose_mode'])
         xys = np.asarray(xys)
         gt_modes = np.asarray(gt_modes)
         return {'rel_poses': xys, 'gt_mode': gt_modes}
     def get_image_info(self, scene_name, idx):
+        #! OccWorld 的时序窗口以固定 T=6 选择参考帧：参考下标为窗口末帧下标减 6。
+        #! 这是 OccWorld 的历史/未来帧布局约定，不是 VAD pkl 中自带的字段。
         T = 6
         idx = idx + self.return_len + self.offset - 1 - T
         info = self.nusc_infos[scene_name][idx]
@@ -152,7 +172,6 @@ class nuScenesSceneDatasetLidar:
             ))
         
         return input_dict
-        
 @OPENOCC_DATASET.register_module()
 class nuScenesSceneDatasetLidarTraverse(nuScenesSceneDatasetLidar):
     def __init__(
@@ -207,6 +226,8 @@ class nuScenesSceneDatasetLidarTraverse(nuScenesSceneDatasetLidar):
         occs = []
         for i in range(self.return_len + self.offset):
             token = self.nusc_infos[scene_name][idx + i]['token']
+            #! 与父类相同，scene_name 必须是 'scene-xxxx' 一类目录名；VAD pkl 的
+            #! info['scene_token'] 需要借助 nuScenes scene 表映射成该名称后再分组。
             label_file = os.path.join(self.data_path, f'{self.input_dataset}/{scene_name}/{token}/labels.npz')
             label = np.load(label_file)
             occ = label['semantics']
@@ -221,7 +242,9 @@ class nuScenesSceneDatasetLidarTraverse(nuScenesSceneDatasetLidar):
             occs.append(occ)
         output_occs = np.stack(occs, dtype=np.int64)
         metas = {}
+        #! OccWorld Traverse 额外把 'scene-xxxx' 名称传给下游，用于场景级遍历和结果组织。
         metas.update(scene_name=scene_name)
+        #! 同父类：此处变量名为 scene_token，但值实际是第 5 帧的 sample token。
         metas.update(scene_token=self.nusc_infos[scene_name][4]['token'])
         metas.update(self.get_meta_data(scene_name, idx))
         if self.test_mode:
@@ -244,6 +267,7 @@ class nuScenesSceneDatasetLidarTraverse(nuScenesSceneDatasetLidar):
                 - gt_labels_3d (np.ndarray): Labels of ground truths.
                 - gt_names (list[str]): Class names of ground truths.
         """
+        #! 检测/运动 GT 与图像元信息使用同一个 OccWorld 固定参考帧（窗口末帧前 6 帧）。
         T = 6
         idx = idx + self.return_len + self.offset - 1 - T
         info = self.nusc_infos[scene_name][idx]
@@ -299,6 +323,7 @@ class nuScenesSceneDatasetLidarTraverse(nuScenesSceneDatasetLidar):
         
         
     def get_image_info(self, scene_name, idx):
+        #! 与父类相同：固定选择窗口末帧之前第 6 帧作为相机与位姿参考帧。
         T = 6
         idx = idx + self.return_len + self.offset - 1 - T
         info = self.nusc_infos[scene_name][idx]
@@ -367,6 +392,5 @@ class nuScenesSceneDatasetLidarTraverse(nuScenesSceneDatasetLidar):
                 focal_positions=focal_positions,
                 lidar2ego=lidar2ego,
             ))
-        
+
         return input_dict
-        
