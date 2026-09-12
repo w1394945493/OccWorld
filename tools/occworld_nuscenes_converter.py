@@ -14,7 +14,6 @@ from pyquaternion import Quaternion
 from nuscenes.nuscenes import NuScenes
 from nuscenes.utils.data_classes import Box
 from shapely.geometry import MultiPoint, box
-from mmdet3d.datasets import NuScenesDataset
 from nuscenes.utils.geometry_utils import view_points
 # MMDetection3D 1.x 将几何结构及投影工具由 ``mmdet3d.core`` 迁移到了
 # ``mmdet3d.structures``。OccWorld 的环境使用 MMDetection3D 1.x；保留旧路径
@@ -31,6 +30,26 @@ from nuscenes.utils.geometry_utils import transform_matrix
 nus_categories = ('car', 'truck', 'trailer', 'bus', 'construction_vehicle',
                   'bicycle', 'motorcycle', 'pedestrian', 'traffic_cone',
                   'barrier')
+
+#! MMDetection3D 0.x 将该映射暴露为 NuScenesDataset.NameMapping，1.x 已不再
+#! 提供这个类属性。映射规则本身与框架版本无关，因此在 converter 内显式保存：
+#! 将 nuScenes 的细粒度原始类别归并为检测/运动预测使用的 10 个类别。
+NUSCENES_NAME_MAPPING = {
+    'movable_object.barrier': 'barrier',
+    'vehicle.bicycle': 'bicycle',
+    'vehicle.bus.bendy': 'bus',
+    'vehicle.bus.rigid': 'bus',
+    'vehicle.car': 'car',
+    'vehicle.construction': 'construction_vehicle',
+    'vehicle.motorcycle': 'motorcycle',
+    'human.pedestrian.adult': 'pedestrian',
+    'human.pedestrian.child': 'pedestrian',
+    'human.pedestrian.construction_worker': 'pedestrian',
+    'human.pedestrian.police_officer': 'pedestrian',
+    'movable_object.trafficcone': 'traffic_cone',
+    'vehicle.trailer': 'trailer',
+    'vehicle.truck': 'truck',
+}
 
 nus_attributes = ('cycle.with_rider', 'cycle.without_rider',
                   'pedestrian.moving', 'pedestrian.standing',
@@ -522,8 +541,8 @@ def _fill_trainval_infos(nusc,
 
             names = [b.name for b in boxes]
             for i in range(len(names)):
-                if names[i] in NuScenesDataset.NameMapping:
-                    names[i] = NuScenesDataset.NameMapping[names[i]]
+                if names[i] in NUSCENES_NAME_MAPPING:
+                    names[i] = NUSCENES_NAME_MAPPING[names[i]]
             names = np.array(names)
 
             # *==============================================================#
@@ -1204,9 +1223,9 @@ def generate_record(ann_rec: dict, x1: float, y1: float, x2: float, y2: float,
     coco_rec['area'] = (y2 - y1) * (x2 - x1)
 
     # *2. 将 nuScenes 细粒度类别映射到检测类别，并生成 COCO bbox/area/category 字段。
-    if repro_rec['category_name'] not in NuScenesDataset.NameMapping:
+    if repro_rec['category_name'] not in NUSCENES_NAME_MAPPING:
         return None
-    cat_name = NuScenesDataset.NameMapping[repro_rec['category_name']]
+    cat_name = NUSCENES_NAME_MAPPING[repro_rec['category_name']]
     coco_rec['category_name'] = cat_name
     coco_rec['category_id'] = nus_categories.index(cat_name)
     coco_rec['bbox'] = [x1, y1, x2 - x1, y2 - y1]
