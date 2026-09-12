@@ -69,12 +69,12 @@ val_dataset_config = dict(
 
 train_wrapper_config = dict(
     type='tpvformer_dataset_nuscenes',
-    phase='train', 
+    phase='train',
 )
 
 val_wrapper_config = dict(
     type='tpvformer_dataset_nuscenes',
-    phase='val', 
+    phase='val',
 )
 
 train_loader = dict(
@@ -132,43 +132,43 @@ model = dict(
         type = 'VAERes2D',
         encoder_cfg=dict(
             type='Encoder2D',
-            ch = base_channel, 
-            out_ch = base_channel, 
-            ch_mult = (1,2,4), 
+            ch = base_channel,
+            out_ch = base_channel,
+            ch_mult = (1,2,4),
             num_res_blocks = 2,
-            attn_resolutions = (50,), 
-            dropout = 0.0, 
-            resamp_with_conv = True, 
+            attn_resolutions = (50,),
+            dropout = 0.0,
+            resamp_with_conv = True,
             in_channels = _dim_ * expansion,
-            resolution = 200, 
-            z_channels = base_channel * 2, 
+            resolution = 200,
+            z_channels = base_channel * 2,
             double_z = False,
-        ), 
+        ),
         decoder_cfg=dict(
             type='Decoder2D',
-            ch = base_channel, 
-            out_ch = _dim_ * expansion, 
-            ch_mult = (1,2,4), 
+            ch = base_channel,
+            out_ch = _dim_ * expansion,
+            ch_mult = (1,2,4),
             num_res_blocks = 2,
-            attn_resolutions = (50,), 
-            dropout = 0.0, 
-            resamp_with_conv = True, 
+            attn_resolutions = (50,),
+            dropout = 0.0,
+            resamp_with_conv = True,
             in_channels = _dim_ * expansion,
-            resolution = 200, 
-            z_channels = base_channel * 2, 
+            resolution = 200,
+            z_channels = base_channel * 2,
             give_pre_end = False
         ),
         num_classes=18,
-        expansion=expansion, 
+        expansion=expansion,
         vqvae_cfg=dict(
             type='VectorQuantizer',
             sane_index_shape=True,
-            n_e = n_e_, 
-            e_dim = base_channel * 2, 
-            beta = 1., 
-            z_channels = base_channel * 2, 
+            n_e = n_e_,
+            e_dim = base_channel * 2,
+            beta = 1.,
+            z_channels = base_channel * 2,
             use_voxel=False)),
-    
+
     transformer=dict(
         type = 'PlanUAutoRegTransformer',
         num_tokens=1,
@@ -182,7 +182,7 @@ model = dict(
         channels=(base_channel*2, base_channel*4, base_channel*8),
         temporal_attn_layers=6,
         output_channel=n_e_,
-        learnable_queries=False
+        learnable_queries=False # * False
     ),
     pose_encoder=dict(
         type = 'PoseEncoder',

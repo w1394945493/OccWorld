@@ -203,13 +203,19 @@ class VAERes2D(BaseModule):
         return mu + sigma * eps, mu, sigma
 
     def forward_encoder(self, x):
-        # x: bs, F, H, W, D
-        bs, F, H, W, D = x.shape
-        x = self.class_embeds(x) # bs, F, H, W, D, c
-        x = x.reshape(bs*F, H, W, D * self.expansion).permute(0, 3, 1, 2)
+        # x: (B,F,H,W,D)，每个体素保存一个整数语义类别编号，而不是连续特征。
+        bs, F, H, W, D = x.shape  # 读取批大小、帧数、BEV长宽和高度层数
+        x = self.class_embeds(x)  # 类别编号->可学习向量：(B,F,H,W,D)->(B,F,H,W,D,C_emb)
+        # 后续 Encoder2D 只接收 (N,C,H,W)，所以需要将每个 BEV 位置上 D 个高度层的
+        # C_emb 维语义向量依高度顺序拼接为一个 D*C_emb 维“垂直柱”特征。
+        # 这里是拼接而非求和/平均：第 d 层始终占据固定的一段通道，因此没有直接抹去高度顺序；
+        # 它以通道形式保存三维信息，从而用计算成本更低的 2D CNN 代替 3D CNN。
+        x = x.reshape(
+            bs*F, H, W, D * self.expansion).permute(
+                0, 3, 1, 2)  # (B,F,H,W,D,C_emb)->(B*F,D*C_emb,H,W)，F作为独立帧编码
 
-        z, shapes = self.encoder(x)
-        return z, shapes
+        z, shapes = self.encoder(x)  # 2D卷积编码并降采样；z为连续潜特征，shapes记录中间空间尺寸
+        return z, shapes  # z交给VQ码本离散化，shapes供decoder逐级恢复分辨率
         
     def forward_decoder(self, z, shapes, input_shape):
         logits = self.decoder(z, shapes)
@@ -328,37 +334,46 @@ class Encoder2D(BaseModule):
 
 
     def forward(self, x):
-        # x: bs, F, H, W, D
-        shapes = []
-        temb = None
+        # ==================== Encoder2D：BEV场景特征压缩 ====================
+        # 整体作用：把高分辨率BEV特征编码成低分辨率连续潜特征，随后再由VQ码本
+        # 将每个低分辨率位置离散化成一个场景token。本模块只做空间特征编码，
+        # 不建模帧间关系，因为时间维F已并入batch，各帧在这里相互独立地通过同一编码器。
+        # 默认形状变化：
+        #   原始occupancy             (B,F,200,200,16)
+        #   类别嵌入并折叠高度后      (B*F,128,200,200)  <- 本函数输入x
+        #   两次2倍下采样后           (B*F,128, 50, 50)  <- 本函数输出h
+        # 因此H/W分别压缩4倍，BEV位置数压缩16倍；通道保存局部三维语义结构。
+        # x: (B*F,D*C_emb,H,W)，高度特征已按层拼接进通道维。
+        shapes = []  # 记录各次下采样前的二维尺寸，供Decoder2D恢复对应分辨率
+        temb = None  # 当前模型不使用扩散模型式的时间步嵌入，但保留ResnetBlock接口
 
-        h = self.conv_in(x)
-        for i_level in range(self.num_resolutions):
+        h = self.conv_in(x)  # 3x3卷积：将D*C_emb个输入通道投影到基础通道数ch
+        for i_level in range(self.num_resolutions):  # 依次处理由高到低的多个空间尺度
             
-            for i_block in range(self.num_res_blocks):
+            for i_block in range(self.num_res_blocks):  # 当前尺度连续执行多个残差块
                 # h = self.down[i_level].block[i_block](hs[-1], temb)
-                h = self.down[i_level].block[i_block](h, temb)
+                h = self.down[i_level].block[i_block](h, temb)  # 提取局部空间特征并调整通道数
 
-                if len(self.down[i_level].attn) > 0:
-                    h = self.down[i_level].attn[i_block](h)
+                if len(self.down[i_level].attn) > 0:  # 配置要求当前分辨率使用空间自注意力时
+                    h = self.down[i_level].attn[i_block](h)  # 建模相距较远BEV位置间的全局关系
                 # hs.append(h)
-            if i_level != self.num_resolutions-1:
-                shapes.append(h.shape[-2:])
+            if i_level != self.num_resolutions-1:  # 最低分辨率层之后不再继续下采样
+                shapes.append(h.shape[-2:])  # 保存下采样前的(H,W)，当前解码器接口仍接收该列表
                 # hs.append(self.down[i_level].downsample(hs[-1]))
-                h = self.down[i_level].downsample(h)
+                h = self.down[i_level].downsample(h)  # 每次H/W减半；两次后200->100->50，累计压缩4倍
 
-        # middle
+        # 瓶颈层：在最低空间分辨率上进一步融合局部特征和全局上下文。
         # h = hs[-1]
         #
-        h = self.mid.block_1(h, temb)
-        h = self.mid.attn_1(h)
-        h = self.mid.block_2(h, temb)
+        h = self.mid.block_1(h, temb)  # 第一个瓶颈残差块
+        h = self.mid.attn_1(h)  # 最低分辨率自注意力，以较低成本建立全局空间联系
+        h = self.mid.block_2(h, temb)  # 第二个瓶颈残差块，继续融合注意力输出
 
-        # end
-        h = self.norm_out(h)
-        h = nonlinearity(h)
-        h = self.conv_out(h)
-        return h, shapes
+        # 输出头：规范化和激活后，将通道投影成VQ量化器所需的潜特征维度。
+        h = self.norm_out(h)  # GroupNorm稳定不同通道的特征分布
+        h = nonlinearity(h)  # Swish非线性激活
+        h = self.conv_out(h)  # 输出连续潜特征z：(B*F,z_channels,H/4,W/4)，默认(B*F,128,50,50)
+        return h, shapes  # h后续进入quant_conv和码本量化；shapes传给decoder
 
 @MODELS.register_module()
 class Decoder2D(BaseModule):
@@ -434,38 +449,40 @@ class Decoder2D(BaseModule):
                                         padding=1)
 
     def forward(self, z, shapes):
-        # z: bs*F, C, H, W
-        self.last_z_shape = z.shape
+        # ==================== Decoder2D：BEV潜特征重建 ====================
+        # 整体作用：把VQ码字经过post_quant_conv后的低分辨率潜特征逐级上采样，
+        # 恢复为高分辨率BEV“垂直柱”特征；随后VAERes2D.forward_decoder()再把
+        # D*C_emb个输出通道拆回D个高度层，并计算每个体素的语义类别logits。
+        # 默认形状变化：(B*F,128,50,50) -> (B*F,128,200,200)。
+        # z: (B*F,C,H/d,W/d)，默认(B*F,128,50,50)，尚不是最终occupancy类别。
+        self.last_z_shape = z.shape  # 保存本次潜特征形状，便于调试或外部查询
 
-        # timestep embedding
-        temb = None
+        temb = None  # 当前模型不使用扩散时间步嵌入，仅为兼容ResnetBlock接口
 
-        # z to block_in
-        h = self.conv_in(z)
+        h = self.conv_in(z)  # 3x3卷积：将z_channels投影到解码器最低分辨率的通道数
 
-        # middle
-        h = self.mid.block_1(h, temb)
-        h = self.mid.attn_1(h)
-        h = self.mid.block_2(h, temb)
+        # 瓶颈层先在50x50低分辨率上融合特征；此处分辨率低，执行注意力成本较小。
+        h = self.mid.block_1(h, temb)  # 第一个瓶颈残差块，提取局部结构
+        h = self.mid.attn_1(h)  # 空间自注意力，建立远距离BEV位置之间的关系
+        h = self.mid.block_2(h, temb)  # 第二个瓶颈残差块，进一步融合注意力输出
 
-        # upsampling
-        for i_level in reversed(range(self.num_resolutions)):
+        for i_level in reversed(range(self.num_resolutions)):  # 从最低尺度逐级恢复到原始BEV尺度
             # for i_block in range(self.num_res_blocks+1):
-            for i_block in range(self.num_res_blocks): # change this to align encoder
-                h = self.up[i_level].block[i_block](h, temb)
-                if len(self.up[i_level].attn) > 0:
-                    h = self.up[i_level].attn[i_block](h)
-            if i_level != 0:
-                h = self.up[i_level].upsample(h, shapes.pop())
+            for i_block in range(self.num_res_blocks):  # 每个尺度使用与Encoder2D数量对应的残差块
+                h = self.up[i_level].block[i_block](h, temb)  # 重建当前尺度局部特征并调整通道数
+                if len(self.up[i_level].attn) > 0:  # 配置指定当前分辨率使用注意力时
+                    h = self.up[i_level].attn[i_block](h)  # 补充当前尺度的全局空间关系
+            if i_level != 0:  # 最高分辨率层不再继续上采样
+                h = self.up[i_level].upsample(
+                    h, shapes.pop())  # H/W约扩大2倍；用Encoder记录尺寸精确恢复50->100->200
 
-        # end
-        if self.give_pre_end:
-            return h
+        if self.give_pre_end:  # 可选：直接返回输出头之前的高分辨率隐藏特征
+            return h  # 跳过归一化、激活和最终通道投影
 
-        h = self.norm_out(h)
-        h = nonlinearity(h)
-        h = self.conv_out(h)
-        return h
+        h = self.norm_out(h)  # GroupNorm稳定高分辨率重建特征的通道分布
+        h = nonlinearity(h)  # Swish非线性激活
+        h = self.conv_out(h)  # 输出(B*F,D*C_emb,H,W)，默认(B*F,128,200,200)
+        return h  # 返回BEV垂直柱特征；外层函数继续拆分高度并生成18类体素logits
 
 
 if __name__ == "__main__":

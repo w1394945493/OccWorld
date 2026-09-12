@@ -43,7 +43,7 @@ def main(local_rank, args):
         gpus = torch.cuda.device_count()  # gpus per node
         print(f"tcp://{ip}:{port}")
         dist.init_process_group(
-            backend="nccl", init_method=f"tcp://{ip}:{port}", 
+            backend="nccl", init_method=f"tcp://{ip}:{port}",
             world_size=hosts * gpus, rank=rank * gpus + local_rank)
         world_size = dist.get_world_size()
         cfg.gpu_ids = range(world_size)
@@ -55,7 +55,7 @@ def main(local_rank, args):
     else:
         distributed = False
         world_size = 1
-    
+
     if local_rank == 0:
         os.makedirs(args.work_dir, exist_ok=True)
         cfg.dump(osp.join(args.work_dir, osp.basename(args.py_config)))
@@ -138,7 +138,7 @@ def main(local_rank, args):
         cfg.resume_from = osp.join(args.work_dir, 'latest.pth')
     if args.resume_from:
         cfg.resume_from = args.resume_from
-    
+
     logger.info('resume from: ' + cfg.resume_from)
     logger.info('work dir: ' + args.work_dir)
 
@@ -155,7 +155,7 @@ def main(local_rank, args):
             best_val_iou = ckpt['best_val_iou']
         if 'best_val_miou' in ckpt:
             best_val_miou = ckpt['best_val_miou']
-            
+
         if hasattr(train_dataset_loader.sampler, 'set_last_iter'):
             train_dataset_loader.sampler.set_last_iter(last_iter)
         print(f'successfully resumed from epoch {epoch}')
@@ -177,18 +177,18 @@ def main(local_rank, args):
                 print(raw_model.vae.load_state_dict(state_dict, strict=False))
         else:
             print(raw_model.load_state_dict(state_dict, strict=False))
-        
+
     # training
     print_freq = cfg.print_freq
     first_run = True
     grad_norm = 0
-    
+
     label_name = get_nuScenes_label_name(cfg.label_mapping)
     unique_label = np.asarray(cfg.unique_label)
     unique_label_str = [label_name[l] for l in unique_label]
     CalMeanIou_sem = multi_step_MeanIou(unique_label, cfg.get('ignore_label', -100), unique_label_str, 'sem', times=cfg.get('eval_length'))
     CalMeanIou_vox = multi_step_MeanIou([1], cfg.get('ignore_label', -100), ['occupied'], 'vox', times=cfg.get('eval_length'))
-    
+
     my_model.eval()
     os.environ['eval'] = 'true'
     val_loss_list = []
@@ -224,20 +224,22 @@ def main(local_rank, args):
     with torch.no_grad():
         plan_loss = 0
         for i_iter_val, (input_occs, target_occs, metas) in enumerate(val_dataset_loader):
-            
+
             input_occs = input_occs.cuda()
             target_occs = target_occs.cuda()
             data_time_e = time.time()
             if cfg.get('eval_with_pose', False):
+                # *==================================================#
+                # * 推理：
                 if not distributed:
                     result_dict = my_model.autoreg_for_stp3_metric(
-                        x=input_occs, metas=metas, 
+                        x=input_occs, metas=metas,
                         start_frame=cfg.get('start_frame', 0),
                         mid_frame=cfg.get('mid_frame', 6),
                         end_frame=cfg.get('end_frame', 12))
                 else:
                     result_dict = my_model.module.autoreg_for_stp3_metric(
-                        x=input_occs, metas=metas, 
+                        x=input_occs, metas=metas,
                         start_frame=cfg.get('start_frame', 0),
                         mid_frame=cfg.get('mid_frame', 6),
                         end_frame=cfg.get('end_frame', 12))
@@ -264,7 +266,7 @@ def main(local_rank, args):
             target_occs_iou = deepcopy(target_occs)
             target_occs_iou[target_occs_iou != 17] = 1
             target_occs_iou[target_occs_iou == 17] = 0
-            
+
             CalMeanIou_sem._after_step(result_dict['sem_pred'], target_occs)
             CalMeanIou_vox._after_step(result_dict['iou_pred'], target_occs_iou)
             val_loss_list.append(loss.detach().cpu().numpy())
@@ -303,15 +305,15 @@ def main(local_rank, args):
     #logger.info(f'metric_stp3 is {metric_stp3}')
     logger.info(f'time_used is {time_used}')
     logger.info(f'FPS is {1/time_used["per_frame"]}')
-                
+
     val_miou, _ = CalMeanIou_sem._after_epoch()
     val_iou, _ = CalMeanIou_vox._after_epoch()
     logger.info(f'PlanRegLoss is {plan_loss/len(val_dataset_loader)}')
     del target_occs, input_occs
-    
+
     #best_val_iou = [max(best_val_iou[i], val_iou[i]) for i in range(len(best_val_iou))]
     #best_val_miou = [max(best_val_miou[i], val_miou[i]) for i in range(len(best_val_miou))]
-    
+
     logger.info(f'Current val iou is {val_iou}')
     logger.info(f'Current val miou is {val_miou}')
     logger.info(f'avg val iou is {(val_iou[1]+val_iou[3]+val_iou[5])/3}')
@@ -330,7 +332,7 @@ if __name__ == '__main__':
     parser.add_argument('--iter-resume', action='store_true', default=False)
     parser.add_argument('--seed', type=int, default=42)
     args = parser.parse_args()
-    
+
     ngpus = torch.cuda.device_count()
     args.gpus = ngpus
     print(args)
