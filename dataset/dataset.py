@@ -38,6 +38,7 @@ class nuScenesSceneDatasetLidar:
         self.return_len = return_len
         self.offset = offset
         self.nusc = nusc
+        # todo times不是时间帧数，而是每个epoch中每个场景被重复抽样的次数；默认每个场景随机取5段窗口。
         self.times = times
         self.test_mode = test_mode
         assert input_dataset in ['gts', 'tpv_dense', 'tpv_sparse']
@@ -47,14 +48,24 @@ class nuScenesSceneDatasetLidar:
 
     def __len__(self):
         'Denotes the total number of samples'
+        # todo 数据集长度按“场景数×重复抽样次数”计算，不是所有合法滑动窗口数量之和。
+        # 例如训练集700个场景、times=5时，每个epoch共有3500个时序样本。
         return len(self.nusc_infos)*self.times
 
     def __getitem__(self, index):
+        # todo 通过取模把扩增后的索引映射回场景；DataLoader打乱索引后，每个场景每轮会被访问times次。
         index = index % len(self.nusc_infos)
         scene_name = self.scene_names[index]
         scene_len = self.scene_lens[index]
+        # todo idx是本次连续时间窗口的“起始帧索引”，不是历史/未来之间的当前帧索引。
+        # 实际读取范围为[idx, idx+return_len+offset-1]；例如idx=7、窗口长度10时读取第7~16帧。
+        # randint上界不取值，因此idx最大为scene_len-return_len-offset，可保证最后一帧不越界。
+        # 每次访问该场景都会随机选择idx，而不是以每帧为中心穷举所有历史/未来滑窗。
+        # 不同抽样窗口允许重叠、重复，也不保证一个epoch覆盖该场景的全部帧。
+        # 该基类的训练集和验证集采用同一随机逻辑，因此验证结果对应随机抽取的场景片段。
         idx = np.random.randint(0, scene_len - self.return_len - self.offset + 1)
         occs = []
+        # todo 从同一场景的idx开始依次读取连续帧，构成一个完整时序样本，而非多个独立样本。
         for i in range(self.return_len + self.offset):
             token = self.nusc_infos[scene_name][idx + i]['token']
             #! OccWorld 特有的 occupancy 数据组织：
@@ -78,6 +89,8 @@ class nuScenesSceneDatasetLidar:
         # output_occs = np.stack(occs, dtype=np.int64)
         output_occs = np.stack(occs).astype(np.int64, copy=False)
         metas = {}
+        #* 记录本次随机窗口的来源，供无界面可视化/数据校验使用；新增字段不会影响现有训练逻辑。
+        metas.update(scene_name=scene_name, window_start=idx)
         #! 注意：这里虽然命名为 scene_token，实际写入的是该场景第 5 个关键帧的
         #! sample token，并非 nuScenes 原生的 scene token；这是 OccWorld 当前代码的接口约定。
         metas.update(scene_token=self.nusc_infos[scene_name][4]['token'])
@@ -86,11 +99,30 @@ class nuScenesSceneDatasetLidar:
         metas.update(self.get_meta_data(scene_name, idx))
         if self.test_mode:
             metas.update(self.get_meta_info(scene_name, idx))
+        # todo offset控制输入与监督的时间错位：输入取前return_len帧，输出从offset帧开始。
+        # VQ-VAE配置offset=0时输入/输出是同一段连续帧，用于逐帧重建，不划分历史和未来。
+        #*==================== Dataset单样本返回值及一/二阶段用途 ====================#
+        # 本函数返回单个样本；DataLoader的collate_fn会在最前面堆叠batch维B，metas则组成长度B的list。
+        #
+        #* 第一阶段VQ-VAE（train_vqvae_custom.py：return_len=10、offset=0）：
+        # input_occs/传给模型后为(B,10,200,200,16)，10帧分别编码、量化和重建；此阶段不预测未来。
+        # output_occs同样为(B,10,200,200,16)，且input_dataset=output_dataset='gts'时与输入内容相同。
+        # metas为长度B的dict列表，虽仍包含rel_poses和gt_mode，但VAERes2D不会使用这些自车信息。
+        #
+        #* 第二阶段OccWorld（train_occworld.py：通常取num_frames+1帧，如15+1=16）：
+        # input_occs为(B,16,200,200,16)，Transformer用前15个Scene Token并行预测后移一帧的t1~t15；
+        # 第16帧不是推理输入历史，而是用于提供最后一个下一帧Token的GT监督。模型内部通过offset=1
+        # 对预测与GT做时间错位；这里Dataset的offset仍可为0，因此返回的两组Occupancy形状均为(B,16,...）。
+        # metas中rel_poses为(B,16,2)、gt_mode为(B,16,3)，第二阶段会将其编码为同步的Pose Token，
+        # 联合监督/预测自车运动；test_mode=True时还会附加3D框等字段供规划碰撞指标使用。
         return input_occs[:self.return_len], output_occs[self.offset:], metas
 
     def get_meta_data(self, scene_name, idx):
         #! OccWorld 从连续窗口内每一帧的 VAD 风格未来轨迹中只取第 0 步，即该帧到
         #! 下一关键帧的 (dx, dy)，再将这些单步位移组织成世界模型使用的 rel_poses。
+        #* 第一阶段VQ-VAE虽然会返回这些字段，但模型不会读取；第二阶段才将它们编码为Pose Token。
+        # 单样本rel_poses形状为(return_len+offset,2)，经过collate后为(B,return_len+offset,2)。
+        # 单样本gt_mode形状为(return_len+offset,3)，经过collate后为(B,return_len+offset,3)。
         gt_modes = []
         xys = []
         for i in range(self.return_len + self.offset):
@@ -257,7 +289,7 @@ class nuScenesSceneDatasetLidarTraverse(nuScenesSceneDatasetLidar):
         output_occs = np.stack(occs).astype(np.int64, copy=False)
         metas = {}
         #! OccWorld Traverse 额外把 'scene-xxxx' 名称传给下游，用于场景级遍历和结果组织。
-        metas.update(scene_name=scene_name)
+        metas.update(scene_name=scene_name, window_start=idx)  # 同时记录确定性遍历窗口的起点
         #! 同父类：此处变量名为 scene_token，但值实际是第 5 帧的 sample token。
         metas.update(scene_token=self.nusc_infos[scene_name][4]['token'])
         metas.update(self.get_meta_data(scene_name, idx))

@@ -215,7 +215,11 @@ def main(local_rank, args):
     label_name = get_nuScenes_label_name(cfg.label_mapping)
     unique_label = np.asarray(cfg.unique_label)
     unique_label_str = [label_name[l] for l in unique_label]
+    #* 两个评估器都按时间位置分别累计整个验证集的混淆矩阵；times=return_len_时最终返回等长列表。
+    # 例如return_len_=10，列表第i项表示所有验证窗口中第i帧汇总后的指标，不是第i个语义类别。
+    # sem：分别计算各有效语义类别IoU后取类别均值，得到每个时间位置的语义mIoU。
     CalMeanIou_sem = multi_step_MeanIou(unique_label, cfg.get('ignore_label', -100), unique_label_str, 'sem', times=cfg.get('return_len_', 10))
+    # vox：把所有非空语义合并为occupied类，得到每个时间位置的二值Occupancy IoU。
     CalMeanIou_vox = multi_step_MeanIou([1], cfg.get('ignore_label', -100), ['occupied'], 'vox', times=cfg.get('return_len_', 10))
 
     # logger.info('compiling model')
@@ -353,10 +357,12 @@ def main(local_rank, args):
                 plan_loss += loss_dict.get('PlanRegLossLidar', 0)
                 if result_dict.get('target_occs', None) is not None:
                     target_occs = result_dict['target_occs']
+                #* 为二值Occupancy IoU构造GT：类别17为空体素，其余语义类别统一视为occupied。
                 target_occs_iou = deepcopy(target_occs)
                 target_occs_iou[target_occs_iou != 17] = 1
                 target_occs_iou[target_occs_iou == 17] = 0
 
+                #* 当前batch按时间位置累加统计量；不是先计算每个样本IoU后再做简单平均。
                 CalMeanIou_sem._after_step(result_dict['sem_pred'], target_occs)
                 CalMeanIou_vox._after_step(result_dict['iou_pred'], target_occs_iou)
                 val_loss_list.append(loss.detach().cpu().numpy())
@@ -368,8 +374,10 @@ def main(local_rank, args):
                         detailed_loss.append(f'{loss_name}: {loss_value:.5f}')
                     detailed_loss = ', '.join(detailed_loss)
                     logger.info(detailed_loss)
-        val_miou, _ = CalMeanIou_sem._after_epoch()
-        val_iou, _ = CalMeanIou_vox._after_epoch()
+        #* 汇总整个验证集：val_miou/val_iou均为长度return_len_的列表，每项对应一个时间位置。
+        # VQ-VAE的offset=0时，这些位置是连续窗口内各帧的重建指标，并非不同未来预测步。
+        val_miou, _ = CalMeanIou_sem._after_epoch()  # 每个时间位置的语义类别平均IoU
+        val_iou, _ = CalMeanIou_vox._after_epoch()  # 每个时间位置的二值占用IoU
 
         del target_occs, input_occs
         plan_loss = plan_loss/len(val_dataset_loader)
@@ -377,6 +385,7 @@ def main(local_rank, args):
             best_plan_loss = plan_loss
         logger.info(f'PlanRegLoss is {plan_loss} while the best plan loss is {best_plan_loss}')
         #logger.info(f'PlanRegLoss is {plan_loss/len(val_dataset_loader)}')
+        #* 每个时间位置独立维护历史最优值，因此列表中的最佳项可能分别来自不同epoch。
         best_val_iou = [max(best_val_iou[i], val_iou[i]) for i in range(len(best_val_iou))]
         best_val_miou = [max(best_val_miou[i], val_miou[i]) for i in range(len(best_val_miou))]
         #logger.info(f'PlanRegLoss is {plan_loss/len(val_dataset_loader)}')
