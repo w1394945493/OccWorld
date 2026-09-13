@@ -69,12 +69,25 @@ def lidar_to_global(info):
     return ego_to_global @ lidar_to_ego
 
 
+def ego_to_global(info):
+    """根据元数据构造当前ego坐标系到global坐标系的变换。"""
+    return transform_matrix(info['ego2global_translation'], info['ego2global_rotation'])
+
+
 def trajectory_in_current_lidar(infos, current_index):
     """将窗口内所有帧的LiDAR原点统一变换到当前帧LiDAR坐标系。"""
     lidar_to_globals = [lidar_to_global(info) for info in infos]
     global_to_current = np.linalg.inv(lidar_to_globals[current_index])
     origin = np.asarray([0.0, 0.0, 0.0, 1.0])
     return np.stack([(global_to_current @ pose @ origin)[:2] for pose in lidar_to_globals])
+
+
+def trajectory_in_current_ego(infos, current_index):
+    """将窗口内各帧ego原点统一表达在当前帧ego坐标系，以便与Occ3D栅格对齐。"""
+    ego_to_globals = [ego_to_global(info) for info in infos]
+    global_to_current_ego = np.linalg.inv(ego_to_globals[current_index])
+    origin = np.asarray([0.0, 0.0, 0.0, 1.0])
+    return np.stack([(global_to_current_ego @ pose @ origin)[:2] for pose in ego_to_globals])
 
 
 def validate_trajectory_coordinates(infos):
@@ -116,51 +129,56 @@ def valid_boxes(info):
     return boxes
 
 
-def box_bev_corners(box):
-    """将[x,y,z,length,width,height,yaw,...]转换为LiDAR BEV中的四个角点。"""
+def box_bev_corners(box, lidar_to_ego_matrix):
+    """生成LiDAR框的四角，并通过标定外参将其转换到当前ego坐标系。"""
     x, y, length, width, yaw = box[0], box[1], box[3], box[4], box[6]
     local = np.asarray([
         [length / 2, width / 2], [length / 2, -width / 2],
         [-length / 2, -width / 2], [-length / 2, width / 2],
     ])
     rotation = np.asarray([[np.cos(yaw), -np.sin(yaw)], [np.sin(yaw), np.cos(yaw)]])
-    return local @ rotation.T + np.asarray([x, y])
+    corners_lidar = local @ rotation.T + np.asarray([x, y])
+    corners_lidar_h = np.concatenate([
+        corners_lidar, np.full((4, 1), box[2]), np.ones((4, 1))], axis=1)
+    return (lidar_to_ego_matrix @ corners_lidar_h.T).T[:, :2]
 
 
 def render_frame(occupancy, info, infos, frame_index, args):
-    """把当前帧Occupancy、3D框和自车轨迹绘制在同一LiDAR BEV坐标系。"""
+    """将Occupancy、3D框和自车轨迹统一到当前ego坐标系后绘制BEV。"""
     bev = occupancy_to_bev(occupancy, args.free_label, args.ignore_label)
     xmin, ymin, _, xmax, ymax, _ = args.pc_range
     cmap = ListedColormap(OCC_COLORS)
     norm = BoundaryNorm(np.arange(-0.5, len(OCC_COLORS) + 0.5), cmap.N)
 
     fig, ax = plt.subplots(figsize=(9, 9), dpi=120)
-    # Occupancy数组前两维按(x,y)组织，因此转置后令数组第0维x显示为横轴、第1维y显示为纵轴。
-    # 注意本项目的轨迹约定是+x为向右横移、+y为向前行驶，并非此处曾误写的“x前向、y向左”。
+    # Occ3D栅格位于当前ego坐标系，数组前两维按(x,y)组织；转置后x显示为横轴、y显示为纵轴。
+    # nuScenes ego坐标约定为+x向前、+y向左。bbox和轨迹原本位于LIDAR_TOP坐标，需通过外参转换。
     ax.imshow(bev.T, origin='lower', extent=[xmin, xmax, ymin, ymax],
               interpolation='nearest', cmap=cmap, norm=norm, alpha=0.82)
 
     boxes = valid_boxes(info)
+    current_lidar_to_ego = transform_matrix(info['lidar2ego_translation'], info['lidar2ego_rotation'])
     for box in boxes:
-        corners = box_bev_corners(box)
+        corners = box_bev_corners(box, current_lidar_to_ego)
         corners = np.vstack([corners, corners[0]])
         ax.plot(corners[:, 0], corners[:, 1], color='black', linewidth=1.0)
-        ax.plot(box[0], box[1], '.', color='black', markersize=2)
+        center_ego = current_lidar_to_ego @ np.asarray([box[0], box[1], box[2], 1.0])
+        ax.plot(center_ego[0], center_ego[1], '.', color='black', markersize=2)
 
-    trajectory = trajectory_in_current_lidar(infos, frame_index)
+    trajectory = trajectory_in_current_ego(infos, frame_index)
     ax.plot(trajectory[:frame_index + 1, 0], trajectory[:frame_index + 1, 1],
             '-o', color='#0066ff', linewidth=2, markersize=4, label='ego history')
     ax.plot(trajectory[frame_index:, 0], trajectory[frame_index:, 1],
             '-o', color='#ff6600', linewidth=2, markersize=4, label='ego future')
     ax.scatter([0], [0], marker='^', s=90, c='#00aa00', edgecolors='black',
                zorder=5, label='current ego')
-    ax.arrow(0, 0, 0, 3, width=0.08, head_width=0.7, color='#00aa00', zorder=5)
+    ax.arrow(0, 0, 3, 0, width=0.08, head_width=0.7, color='#00aa00', zorder=5)
 
     token = info.get('token', 'unknown')
     ax.set_title(f"{args.split} | frame {frame_index + 1}/{len(infos)} | "
                  f"token={token[:12]} | boxes={len(boxes)}")
-    ax.set_xlabel('local x / right-lateral (m)')
-    ax.set_ylabel('local y / forward (m)')
+    ax.set_xlabel('ego x / forward (m)')
+    ax.set_ylabel('ego y / left (m)')
     ax.set_xlim(xmin, xmax)
     ax.set_ylim(ymin, ymax)
     ax.set_aspect('equal')
