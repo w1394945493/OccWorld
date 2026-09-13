@@ -10,7 +10,10 @@ from mmengine.optim import build_optim_wrapper
 from mmengine.logging import MMLogger
 from mmengine.utils import symlink
 from mmengine.registry import MODELS
-from timm.scheduler import CosineLRScheduler, MultiStepLRScheduler
+try:
+    from timm.scheduler import CosineLRScheduler, MultiStepLRScheduler
+except ImportError:
+    from timm.scheduler import CosineLRScheduler
 from utils.load_save_util import revise_ckpt, revise_ckpt_1
 import warnings
 warnings.filterwarnings("ignore")
@@ -202,8 +205,8 @@ def main(local_rank, args):
             if first_run:
                 i_iter = i_iter + last_iter
             
-            input_occs = input_occs.cuda()
-            target_occs = target_occs.cuda()
+            input_occs = input_occs.cuda() # (1 10 200 20 16)
+            target_occs = target_occs.cuda() # (1 10 200 200 16)
             data_time_e = time.time()
 
             result_dict = my_model(x=input_occs, metas=metas)
@@ -276,6 +279,7 @@ def main(local_rank, args):
         epoch += 1
         first_run = False
         
+        # ========================================================#
         # eval
         if epoch % cfg.get('eval_every_epochs', 1) != 0:
             continue

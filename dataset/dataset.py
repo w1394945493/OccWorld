@@ -44,7 +44,7 @@ class nuScenesSceneDatasetLidar:
         assert output_dataset == 'gts', f'only used for evaluation, output_dataset should be gts, but got {output_dataset}'
         self.input_dataset = input_dataset
         self.output_dataset = output_dataset
-        
+
     def __len__(self):
         'Denotes the total number of samples'
         return len(self.nusc_infos)*self.times
@@ -65,16 +65,18 @@ class nuScenesSceneDatasetLidar:
             label = np.load(label_file)
             occ = label['semantics']
             occs.append(occ)
-        input_occs = np.stack(occs, dtype=np.int64)
+        # input_occs = np.stack(occs, dtype=np.int64)
+        input_occs = np.stack(occs).astype(np.int64, copy=False)
         occs = []
         for i in range(self.return_len + self.offset):
             token = self.nusc_infos[scene_name][idx + i]['token']
             #! output_dataset 当前被限制为 gts，用作未来 occupancy 的监督/评估目标。
-            label_file = os.path.join(self.data_path, f'{self.output_dataset}/{scene_name}/{token}/labels.npz')
+            label_file = os.path.join(self.occ_path, f'{self.output_dataset}/{scene_name}/{token}/labels.npz')
             label = np.load(label_file)
             occ = label['semantics']
             occs.append(occ)
-        output_occs = np.stack(occs, dtype=np.int64)
+        # output_occs = np.stack(occs, dtype=np.int64)
+        output_occs = np.stack(occs).astype(np.int64, copy=False)
         metas = {}
         #! 注意：这里虽然命名为 scene_token，实际写入的是该场景第 5 个关键帧的
         #! sample token，并非 nuScenes 原生的 scene token；这是 OccWorld 当前代码的接口约定。
@@ -120,7 +122,7 @@ class nuScenesSceneDatasetLidar:
         cam_intrinsics = []
         cam_positions = []
         focal_positions = []
-        
+
         lidar2ego_r = Quaternion(info['lidar2ego_rotation']).rotation_matrix
         lidar2ego = np.eye(4)
         lidar2ego[:3, :3] = lidar2ego_r
@@ -149,18 +151,14 @@ class nuScenesSceneDatasetLidar:
             ego2cam_rt = np.eye(4)
             ego2cam_rt[:3, :3] = ego2cam_r.T
             ego2cam_rt[3, :3] = -ego2cam_t
-            
-            
+
             cam_position = np.linalg.inv(ego2cam_rt.T) @ np.array([0., 0., 0., 1.]).reshape([4, 1])
             focal_position = np.linalg.inv(ego2cam_rt.T) @ np.array([0., 0., f, 1.]).reshape([4, 1])
-            #cam_position = np.linalg.inv(lidar2cam_rt.T) @ np.array([0., 0., 0., 1.]).reshape([4, 1])
+            # cam_position = np.linalg.inv(lidar2cam_rt.T) @ np.array([0., 0., 0., 1.]).reshape([4, 1])
             cam_positions.append(cam_position.flatten()[:3])
-            #focal_position = np.linalg.inv(lidar2cam_rt.T) @ np.array([0., 0., f, 1.]).reshape([4, 1])
+            # focal_position = np.linalg.inv(lidar2cam_rt.T) @ np.array([0., 0., f, 1.]).reshape([4, 1])
             focal_positions.append(focal_position.flatten()[:3])
-        
-        
-        
-        
+
         input_dict.update(
             dict(
                 img_filename=image_paths,
@@ -172,7 +170,7 @@ class nuScenesSceneDatasetLidar:
                 focal_positions=focal_positions,
                 lidar2ego=lidar2ego,
             ))
-        
+
         return input_dict
 @OPENOCC_DATASET.register_module()
 class nuScenesSceneDatasetLidarTraverse(nuScenesSceneDatasetLidar):

@@ -235,7 +235,7 @@ class VAERes2D(BaseModule):
         
         output_dict = {}
         z, shapes = self.forward_encoder(x)
-        if self.use_vq:
+        if self.use_vq: # True
             z_sampled, loss, info = self.vqvae(z, is_voxel=False)
             output_dict.update({'embed_loss': loss})
         else:
