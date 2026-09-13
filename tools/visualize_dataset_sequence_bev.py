@@ -77,6 +77,19 @@ def trajectory_in_current_lidar(infos, current_index):
     return np.stack([(global_to_current @ pose @ origin)[:2] for pose in lidar_to_globals])
 
 
+def validate_trajectory_coordinates(infos):
+    """用pkl自带的下一帧位移，校验位姿变换得到的轨迹是否处于同一坐标系。"""
+    errors = []
+    for frame_index, info in enumerate(infos[:-1]):
+        gt_future = np.asarray(info.get('gt_ego_fut_trajs', []))
+        if gt_future.ndim != 2 or gt_future.shape[0] == 0 or gt_future.shape[1] < 2:
+            continue
+        trajectory = trajectory_in_current_lidar(infos, frame_index)
+        pose_step = trajectory[frame_index + 1] - trajectory[frame_index]
+        errors.append(np.linalg.norm(pose_step - gt_future[0, :2]))
+    return np.asarray(errors, dtype=np.float64)
+
+
 def occupancy_to_bev(occupancy, free_label, ignore_label):
     """沿高度取最高的有效占用体素，生成便于核对位置关系的BEV语义图。"""
     if occupancy.ndim != 3:
@@ -122,7 +135,8 @@ def render_frame(occupancy, info, infos, frame_index, args):
     norm = BoundaryNorm(np.arange(-0.5, len(OCC_COLORS) + 0.5), cmap.N)
 
     fig, ax = plt.subplots(figsize=(9, 9), dpi=120)
-    # Occupancy数组前两维按(x,y)组织，因此转置后令横轴为LiDAR x、纵轴为LiDAR y。
+    # Occupancy数组前两维按(x,y)组织，因此转置后令数组第0维x显示为横轴、第1维y显示为纵轴。
+    # 注意本项目的轨迹约定是+x为向右横移、+y为向前行驶，并非此处曾误写的“x前向、y向左”。
     ax.imshow(bev.T, origin='lower', extent=[xmin, xmax, ymin, ymax],
               interpolation='nearest', cmap=cmap, norm=norm, alpha=0.82)
 
@@ -140,13 +154,13 @@ def render_frame(occupancy, info, infos, frame_index, args):
             '-o', color='#ff6600', linewidth=2, markersize=4, label='ego future')
     ax.scatter([0], [0], marker='^', s=90, c='#00aa00', edgecolors='black',
                zorder=5, label='current ego')
-    ax.arrow(0, 0, 3, 0, width=0.08, head_width=0.7, color='#00aa00', zorder=5)
+    ax.arrow(0, 0, 0, 3, width=0.08, head_width=0.7, color='#00aa00', zorder=5)
 
     token = info.get('token', 'unknown')
     ax.set_title(f"{args.split} | frame {frame_index + 1}/{len(infos)} | "
                  f"token={token[:12]} | boxes={len(boxes)}")
-    ax.set_xlabel('LiDAR x / forward (m)')
-    ax.set_ylabel('LiDAR y / left (m)')
+    ax.set_xlabel('local x / right-lateral (m)')
+    ax.set_ylabel('local y / forward (m)')
     ax.set_xlim(xmin, xmax)
     ax.set_ylim(ymin, ymax)
     ax.set_aspect('equal')
@@ -197,6 +211,12 @@ def main():
     print(f'Scene/window : {scene_name}, start={window_start}, frames={len(input_occs)}')
     print(f'Occupancy    : shape={input_occs.shape}, dtype={input_occs.dtype}, '
           f'labels={np.unique(input_occs).tolist()}')
+    trajectory_errors = validate_trajectory_coordinates(infos)
+    if len(trajectory_errors):
+        print(f'Pose/GT check: mean_error={trajectory_errors.mean():.6f} m, '
+              f'max_error={trajectory_errors.max():.6f} m')
+        if trajectory_errors.max() > 1e-3:
+            print('WARNING      : 位姿轨迹与gt_ego_fut_trajs不一致，请检查pkl的坐标约定或变换矩阵。')
 
     writer = None
     try:
