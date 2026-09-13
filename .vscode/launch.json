@@ -27,7 +27,7 @@
             "program": "/vepfs-mlp2/c20250502/haoce/wangyushen/OccWorld/train.py",
             "args": [
                 "--py-config",
-                "/vepfs-mlp2/c20250502/haoce/wangyushen/OccWorld/config/train_vqvae_custom.py",
+                "/vepfs-mlp2/c20250502/haoce/wangyushen/OccWorld/config/train_vqvae_debug.py",
                 "--work-dir",
                 "out/vqvae",
             ],

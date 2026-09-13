@@ -4,7 +4,7 @@ max_epochs = 200  # 最大训练轮数；train.py会完整遍历训练集200次
 warmup_iters = 200  # 学习率预热步数；前200个优化iteration内从warmup_lr_init逐渐升至基础学习率
 return_len_ = 10  # 每个数据样本包含的连续Occupancy帧数；表示时序长度F，不是batch size
 
-batch_size = 2  # 每张GPU每个iteration加载的时序样本数；多卡全局BS=batch_size×GPU数
+batch_size = 1  # 每张GPU每个iteration加载的时序样本数；多卡全局BS=batch_size×GPU数
 num_workers = 2  # 每个DataLoader进程使用的数据读取子进程数；训练集和验证集共用该配置
 save_every_epochs = 1  # 每训练1个epoch保存一次checkpoint，并更新latest.pth软链接
 max_keep_ckpts = 1  # 最多保留最新5个epoch_N.pth；设为0或负数时不自动删除旧权重

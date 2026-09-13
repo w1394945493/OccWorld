@@ -15,7 +15,20 @@ python eval_metric_stp3.py \
   --py-config config/occworld.py \
   --work-dir out/occworld
 
+# ========================================================#
+# stage1
 # 训练 VQ-VAE
 python train.py \
   --py-config /vepfs-mlp2/c20250502/haoce/wangyushen/OccWorld/config/train_vqvae_custom.py \
   --work-dir out/vqvae
+
+
+
+
+
+# ========================================================#
+# stage1: VQ-VAE
+cd /vepfs-mlp2/c20250502/haoce/wangyushen/OccWorld/run.sh
+. /root/miniconda3/bin/activate
+conda /vepfs-mlp2/c20250502/haoce/wangyushen/conda_env/wangyushentemp
+bash sh/train_stage1.sh
