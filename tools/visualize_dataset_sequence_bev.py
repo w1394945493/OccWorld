@@ -24,13 +24,29 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 
-# Occ3D-nuScenes 17个占用语义类别的常用颜色；最后的白色对应free体素。
+# 与visualize_demo.py及config/label_mapping/nuscenes-occ.yaml保持一致：
+# 0=others；1~16依次为barrier~vegetation；17=empty/free。
+# 官方demo绘制时直接过滤掉0和17，因此其颜色表只显式列出了中间的1~16类；
+# 这里使用Matplotlib按原始类别编号索引颜色，必须在首尾分别补上others和empty颜色。
 OCC_COLORS = np.asarray([
-    [255, 120, 50], [255, 192, 203], [255, 255, 0], [0, 150, 245],
-    [0, 255, 255], [255, 127, 0], [255, 0, 0], [255, 240, 150],
-    [135, 60, 0], [160, 32, 240], [255, 0, 255], [139, 137, 137],
-    [75, 0, 75], [150, 240, 80], [230, 230, 250], [0, 175, 0],
-    [0, 191, 255], [255, 255, 255],
+    [0, 0, 0],        # 0: others（官方demo不显示）
+    [255, 120, 50],   # 1: barrier
+    [255, 192, 203],  # 2: bicycle
+    [255, 255, 0],    # 3: bus
+    [0, 150, 245],    # 4: car
+    [0, 255, 255],    # 5: construction_vehicle
+    [255, 127, 0],    # 6: motorcycle
+    [255, 0, 0],      # 7: pedestrian
+    [255, 240, 150],  # 8: traffic_cone
+    [135, 60, 0],     # 9: trailer
+    [160, 32, 240],   # 10: truck
+    [255, 0, 255],    # 11: driveable_surface
+    [139, 137, 137],  # 12: other_flat
+    [75, 0, 75],      # 13: sidewalk
+    [150, 240, 80],   # 14: terrain
+    [230, 230, 250],  # 15: manmade
+    [0, 175, 0],      # 16: vegetation
+    [255, 255, 255],  # 17: empty/free（BEV背景）
 ], dtype=np.float32) / 255.0
 
 
@@ -42,6 +58,12 @@ def parse_args():
     parser.add_argument('--dataset-index', type=int, default=-1,
                         help='Dataset索引；负数表示依据seed随机选择')
     parser.add_argument('--seed', type=int, default=42, help='控制Dataset内部随机窗口起点')
+    parser.add_argument('--motion', choices=['any', 'turn'], default='any',
+                        help='any随机抽样；turn优先选择自车轨迹发生明显转向的窗口')
+    parser.add_argument('--min-turn-deg', type=float, default=10.0,
+                        help='turn模式的最小首尾航向变化，单位度')
+    parser.add_argument('--min-lateral-m', type=float, default=3.0,
+                        help='turn模式的最小累计横向偏移，单位m；满足两个阈值之一即可')
     parser.add_argument('--output', default='out/dataset_sequence_bev.mp4', help='输出MP4路径')
     parser.add_argument('--fps', type=float, default=2.0, help='输出视频帧率')
     parser.add_argument('--pc-range', type=float, nargs=6,
@@ -49,6 +71,8 @@ def parse_args():
                         metavar=('XMIN', 'YMIN', 'ZMIN', 'XMAX', 'YMAX', 'ZMAX'),
                         help='Occupancy对应的LiDAR坐标范围')
     parser.add_argument('--free-label', type=int, default=17, help='空体素类别编号')
+    parser.add_argument('--unknown-label', type=int, default=0,
+                        help='others/unknown类别编号；与官方demo一致，不作为有效占用显示')
     parser.add_argument('--ignore-label', type=int, default=255, help='无效/忽略体素类别编号')
     parser.add_argument('--save-frames', action='store_true', help='同时保存逐帧PNG检查图')
     return parser.parse_args()
@@ -103,11 +127,57 @@ def validate_trajectory_coordinates(infos):
     return np.asarray(errors, dtype=np.float64)
 
 
-def occupancy_to_bev(occupancy, free_label, ignore_label):
+def turn_metrics(infos):
+    """计算窗口末帧相对首帧ego坐标系的横向偏移和航向变化。"""
+    first_to_global = ego_to_global(infos[0])
+    last_to_global = ego_to_global(infos[-1])
+    last_to_first = np.linalg.inv(first_to_global) @ last_to_global
+    lateral_m = abs(float(last_to_first[1, 3]))
+    turn_deg = abs(float(np.degrees(np.arctan2(last_to_first[1, 0], last_to_first[0, 0]))))
+    return lateral_m, turn_deg
+
+
+def select_turn_window(dataset, rng, dataset_index, min_lateral_m, min_turn_deg):
+    """只扫描轻量级pkl位姿，从所有合法连续窗口中随机选择明显转向片段。"""
+    scene_indices = range(len(dataset.scene_names))
+    if dataset_index >= 0:
+        scene_indices = [dataset_index % len(dataset.scene_names)]
+    candidates = []
+    window_len = dataset.return_len
+    required_len = dataset.return_len + dataset.offset
+    for scene_index in scene_indices:
+        scene_name = dataset.scene_names[scene_index]
+        scene_infos = dataset.nusc_infos[scene_name]
+        for window_start in range(len(scene_infos) - required_len + 1):
+            infos = scene_infos[window_start:window_start + window_len]
+            lateral_m, turn_deg = turn_metrics(infos)
+            if lateral_m >= min_lateral_m or turn_deg >= min_turn_deg:
+                candidates.append((scene_index, scene_name, window_start, lateral_m, turn_deg))
+    if not candidates:
+        raise RuntimeError(
+            f'没有找到转向窗口：lateral>={min_lateral_m}m或turn>={min_turn_deg}deg；'
+            '请适当降低--min-lateral-m/--min-turn-deg。')
+    return candidates[int(rng.randint(0, len(candidates)))], len(candidates)
+
+
+def load_input_occupancies(dataset, scene_name, window_start):
+    """按照Dataset路径约定加载一个已经确定起点的连续Occupancy窗口。"""
+    occs = []
+    for info in dataset.nusc_infos[scene_name][window_start:window_start + dataset.return_len]:
+        label_file = osp.join(
+            dataset.occ_path, dataset.input_dataset, scene_name, info['token'], 'labels.npz')
+        with np.load(label_file) as label:
+            occs.append(label['semantics'])
+    return np.stack(occs).astype(np.int64, copy=False)
+
+
+def occupancy_to_bev(occupancy, free_label, unknown_label, ignore_label):
     """沿高度取最高的有效占用体素，生成便于核对位置关系的BEV语义图。"""
     if occupancy.ndim != 3:
         raise ValueError(f'期望单帧Occupancy形状为(H,W,D)，实际为{occupancy.shape}')
-    occupied = (occupancy != free_label) & (occupancy != ignore_label)
+    # 官方visualize_demo.py仅显示0<label<17，即排除others(0)、empty(17)和ignore(255)。
+    occupied = ((occupancy != free_label) & (occupancy != unknown_label)
+                & (occupancy != ignore_label))
     has_occupied = occupied.any(axis=2)
     top_from_end = np.argmax(occupied[:, :, ::-1], axis=2)
     top_index = occupancy.shape[2] - 1 - top_from_end
@@ -145,7 +215,8 @@ def box_bev_corners(box, lidar_to_ego_matrix):
 
 def render_frame(occupancy, info, infos, frame_index, args):
     """将Occupancy、3D框和自车轨迹统一到当前ego坐标系后绘制BEV。"""
-    bev = occupancy_to_bev(occupancy, args.free_label, args.ignore_label)
+    bev = occupancy_to_bev(
+        occupancy, args.free_label, args.unknown_label, args.ignore_label)
     xmin, ymin, _, xmax, ymax, _ = args.pc_range
     cmap = ListedColormap(OCC_COLORS)
     norm = BoundaryNorm(np.arange(-0.5, len(OCC_COLORS) + 0.5), cmap.N)
@@ -198,6 +269,7 @@ def main():
     from dataset import OPENOCC_DATASET
 
     np.random.seed(args.seed)  # 同时固定Dataset内部np.random.randint选择的窗口起点
+    rng = np.random.RandomState(args.seed)  # 单独用于转向候选窗口的可复现随机选择
     cfg = Config.fromfile(args.py_config)
     dataset_cfg = dict(cfg.train_dataset_config if args.split == 'train' else cfg.val_dataset_config)
     dataset_cfg['test_mode'] = False  # 本脚本直接按每帧info读取框，无需Dataset固定参考帧的评估元数据
@@ -206,14 +278,23 @@ def main():
     if len(dataset) == 0:
         raise RuntimeError('Dataset长度为0，无法抽样。')
     dataset_index = args.dataset_index
-    if dataset_index < 0:
-        dataset_index = int(np.random.randint(0, len(dataset)))
-    if dataset_index >= len(dataset):
-        raise IndexError(f'dataset-index={dataset_index}超出[0,{len(dataset) - 1}]')
-
-    input_occs, _, metas = dataset[dataset_index]  # 确实调用项目Dataset类完成随机数据包加载
-    scene_name = metas['scene_name']
-    window_start = int(metas['window_start'])
+    selection_text = 'random'
+    if args.motion == 'turn':
+        selected, candidate_count = select_turn_window(
+            dataset, rng, dataset_index, args.min_lateral_m, args.min_turn_deg)
+        scene_index, scene_name, window_start, lateral_m, turn_deg = selected
+        dataset_index = scene_index
+        input_occs = load_input_occupancies(dataset, scene_name, window_start)
+        selection_text = (f'turn ({candidate_count} candidates, lateral={lateral_m:.2f}m, '
+                          f'heading_change={turn_deg:.1f}deg)')
+    else:
+        if dataset_index < 0:
+            dataset_index = int(np.random.randint(0, len(dataset)))
+        if dataset_index >= len(dataset):
+            raise IndexError(f'dataset-index={dataset_index}超出[0,{len(dataset) - 1}]')
+        input_occs, _, metas = dataset[dataset_index]  # any模式沿用Dataset原始随机窗口逻辑
+        scene_name = metas['scene_name']
+        window_start = int(metas['window_start'])
     infos = dataset.nusc_infos[scene_name][window_start:window_start + len(input_occs)]
     if len(infos) != len(input_occs):
         raise RuntimeError('元数据帧数与Occupancy帧数不一致。')
@@ -226,6 +307,7 @@ def main():
 
     print(f'Dataset type : {dataset.__class__.__name__}')
     print(f'Dataset index: {dataset_index}')
+    print(f'Selection    : {selection_text}')
     print(f'Scene/window : {scene_name}, start={window_start}, frames={len(input_occs)}')
     print(f'Occupancy    : shape={input_occs.shape}, dtype={input_occs.dtype}, '
           f'labels={np.unique(input_occs).tolist()}')
