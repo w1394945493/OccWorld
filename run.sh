@@ -23,12 +23,33 @@ python train.py \
   --work-dir out/vqvae
 
 
+# 可视化原始数据集
+python tools/visualize_dataset_sequence_bev.py \
+  --py-config config/train_vqvae_custom.py \
+  --split val \
+  --seed 42 \
+  --motion turn \
+  --output out/dataset_check/val_random.mp4 \
+  --fps 2 \
+  --save-frames
+
+# ========================================================#
+# stage2 完整训练
+python train.py \
+  --py-config /vepfs-mlp2/c20250502/haoce/wangyushen/OccWorld/config/train_occworld_custom.py \
+  --work-dir out/occworld
 
 
 
 # ========================================================#
 # stage1: VQ-VAE
-cd /vepfs-mlp2/c20250502/haoce/wangyushen/OccWorld/run.sh
+cd /vepfs-mlp2/c20250502/haoce/wangyushen/OccWorld/
 . /root/miniconda3/bin/activate
-conda /vepfs-mlp2/c20250502/haoce/wangyushen/conda_env/wangyushentemp
+conda activate /vepfs-mlp2/c20250502/haoce/wangyushen/conda_env/wangyushentemp
 bash sh/train_stage1.sh
+
+# stage2: OccWorld
+cd /vepfs-mlp2/c20250502/haoce/wangyushen/OccWorld/
+. /root/miniconda3/bin/activate
+conda activate /vepfs-mlp2/c20250502/haoce/wangyushen/conda_env/wangyushentemp
+bash sh/train_stage2.sh
