@@ -215,8 +215,13 @@ def box_bev_corners(box, lidar_to_ego_matrix):
 
 def render_frame(occupancy, info, infos, frame_index, args):
     """将Occupancy、3D框和自车轨迹统一到当前ego坐标系后绘制BEV。"""
-    bev = occupancy_to_bev(
-        occupancy, args.free_label, args.unknown_label, args.ignore_label)
+    # *==================== 3D Occupancy投影为2D BEV ====================#
+    # occupancy形状为(H,W,D)，每个体素保存一个语义类别编号；D表示离散高度层。
+    # occupancy_to_bev()沿高度方向检查每个(x,y)位置，并选择最高处的有效占用体素类别，
+    # 同时排除empty/free、others/unknown和ignore体素；整列均无有效占用时填入free_label。
+    # 返回bev形状为(H,W)，供后续使用不同颜色绘制俯视语义图。这里只压缩高度维，
+    # 不执行LiDAR/ego坐标变换；该Occupancy本身已经位于当前帧ego坐标系。
+    bev = occupancy_to_bev(occupancy, args.free_label, args.unknown_label, args.ignore_label)
     xmin, ymin, _, xmax, ymax, _ = args.pc_range
     cmap = ListedColormap(OCC_COLORS)
     norm = BoundaryNorm(np.arange(-0.5, len(OCC_COLORS) + 0.5), cmap.N)
@@ -227,16 +232,32 @@ def render_frame(occupancy, info, infos, frame_index, args):
     ax.imshow(bev.T, origin='lower', extent=[xmin, xmax, ymin, ymax],
               interpolation='nearest', cmap=cmap, norm=norm, alpha=0.82)
 
+    # *==================== 3D BBox转换到Occupancy所在的ego坐标系 ====================#
+    # 从当前帧info中读取LiDAR坐标系下的GT框，并使用valid_flag或num_lidar_pts过滤无效框。
+    # boxes通常形如(N,7)，每个框为[x,y,z,length,width,height,yaw]。
     boxes = valid_boxes(info)
+    # 根据当前帧LIDAR_TOP的标定平移和旋转构造齐次矩阵T_lidar_to_ego；
+    # 后续用它把LiDAR坐标系中的框统一转换到Occ3D使用的当前ego坐标系。
     current_lidar_to_ego = transform_matrix(info['lidar2ego_translation'], info['lidar2ego_rotation'])
-    for box in boxes:
+    for box in boxes:  # 逐个绘制当前帧的有效3D框
+        # 先根据框中心、长宽和yaw计算LiDAR BEV四角，再用T_lidar_to_ego转换为ego坐标，输出(4,2)。
         corners = box_bev_corners(box, current_lidar_to_ego)
+        # 在末尾重复第一个角点，将4个角点闭合为“角1→角2→角3→角4→角1”的矩形折线。
         corners = np.vstack([corners, corners[0]])
-        ax.plot(corners[:, 0], corners[:, 1], color='black', linewidth=1.0)
+        ax.plot(corners[:, 0], corners[:, 1], color='black', linewidth=1.0)  # 绘制ego坐标系下的框轮廓
+        # 将LiDAR框中心写成齐次坐标[x,y,z,1]并左乘外参，得到ego坐标系下的三维中心。
         center_ego = current_lidar_to_ego @ np.asarray([box[0], box[1], box[2], 1.0])
-        ax.plot(center_ego[0], center_ego[1], '.', color='black', markersize=2)
+        ax.plot(center_ego[0], center_ego[1], '.', color='black', markersize=2)  # 在BEV中标出框中心
 
+    # *==================== 自车历史/未来轨迹坐标统一 ====================#
+    # infos包含当前连续窗口内的全部帧；每帧均提供该时刻ego坐标系到global坐标系的位姿。
+    # trajectory_in_current_ego()先把各帧ego原点变换到global，再统一变换到第frame_index帧的
+    # 当前ego坐标系，使轨迹与当前帧Occ3D Occupancy使用相同坐标约定：+x向前、+y向左。
+    # 返回trajectory形状为(F,2)，其中F为窗口帧数，每行是对应时刻相对当前自车的(x,y)位置；
+    # trajectory[frame_index]理论上为(0,0)，之前的点用于绘制历史，当前点及之后的点用于绘制未来。
     trajectory = trajectory_in_current_ego(infos, frame_index)
+
+
     ax.plot(trajectory[:frame_index + 1, 0], trajectory[:frame_index + 1, 1],
             '-o', color='#0066ff', linewidth=2, markersize=4, label='ego history')
     ax.plot(trajectory[frame_index:, 0], trajectory[frame_index:, 1],
