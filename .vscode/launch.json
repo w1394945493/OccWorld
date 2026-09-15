@@ -52,5 +52,25 @@
             },
             "console": "integratedTerminal"
         },
+        {
+            "name": "occworld generate dataset",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "tools/occworld_nuscenes_converter.py",
+            "args": [
+                "--root-path", "/c20250502/wangyushen/Datasets/NuScenes/v1.0-trainval",
+                "--canbus", "/c20250502/wangyushen/Datasets/NuScenes",
+                "--occ3d-root", "/c20250502/wangyushen/Datasets/occ3d_nuscenes/gts",
+                "--out-dir", "out/debug",
+                "--extra-tag", "nuscenes",
+                "--version", "v1.0",
+                "--max-sweeps", "10",
+                "--min-scene-frames", "16"
+            ],
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "0",
+            },
+            "console": "integratedTerminal"
+        },     
     ]
 }
