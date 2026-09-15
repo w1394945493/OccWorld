@@ -255,7 +255,8 @@ def render_frame(occ, infos, frame_idx, scene_name, occ_path, traj, args):
 
     info = infos[frame_idx]
     ax.set_title(f'{scene_name} | frame={frame_idx}/{len(infos)-1} | '
-                 f'token={info["token"]} | occ={osp.basename(occ_path)}')
+                 f'token={info["token"]} | pose_idx={info.get("pose_idx", "?")} | '
+                 f'occ={osp.basename(occ_path)}')
     ax.set_xlabel('local x / forward (m)')
     ax.set_ylabel('local y / left (m)')
     ax.set_xlim(xmin, xmax)

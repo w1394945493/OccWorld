@@ -187,21 +187,39 @@ def relative_positions_in_current(poses_lidar, current_idx, indices):
     return np.asarray(points, dtype=np.float64)
 
 
-def build_history_trajs(poses_lidar, frame_idx, his_ts):
-    """构造历史 his_ts 步相邻位移；场景开头不足时用最早帧重复补齐。"""
-    indices = [max(0, frame_idx - i) for i in range(his_ts, -1, -1)]
-    positions = relative_positions_in_current(poses_lidar, frame_idx, indices)
+def token_to_pose_index(token):
+    """SemanticKITTI token/文件名转 poses.txt 行号。
+
+    #! FoundationSSC 的 occupancy 文件名通常是 000000_1_1.npy、000005_1_1.npy ...
+    #! 其中 000110 不是“第22个occupancy样本”的pose，而是 poses.txt 中第110行对应的原始帧。
+    #! 因此位姿索引必须由 int(token) 得到，不能使用窗口内的 frame_idx/list index。
+    """
+    return int(token)
+
+
+def build_history_trajs(poses_lidar, token_pose_indices, frame_idx, his_ts):
+    """构造历史 his_ts 步相邻位移；按 occupancy token 对应的真实 pose 行号取位姿。
+
+    frame_idx 是 tokens 列表中的位置，例如第22个可用occupancy帧；
+    token_pose_indices[frame_idx] 才是 poses.txt 中的真实行号，例如 110。
+    """
+    token_indices = [max(0, frame_idx - i) for i in range(his_ts, -1, -1)]
+    pose_indices = [token_pose_indices[i] for i in token_indices]
+    current_pose_idx = token_pose_indices[frame_idx]
+    positions = relative_positions_in_current(poses_lidar, current_pose_idx, pose_indices)
     return (positions[1:] - positions[:-1])[:, :2].astype(np.float32)
 
 
-def build_future_trajs(poses_lidar, frame_idx, fut_ts):
-    """构造未来 fut_ts 步相邻位移和有效mask；场景末尾不足时用最后帧补齐。"""
-    max_idx = len(poses_lidar) - 1
-    indices = [min(max_idx, frame_idx + i) for i in range(fut_ts + 1)]
+def build_future_trajs(poses_lidar, token_pose_indices, frame_idx, fut_ts):
+    """构造未来 fut_ts 步相邻位移和有效mask；按可用occupancy帧序列向后取。"""
+    max_token_idx = len(token_pose_indices) - 1
+    token_indices = [min(max_token_idx, frame_idx + i) for i in range(fut_ts + 1)]
+    pose_indices = [token_pose_indices[i] for i in token_indices]
     masks = np.asarray(
-        [1.0 if frame_idx + i <= max_idx else 0.0 for i in range(1, fut_ts + 1)],
+        [1.0 if frame_idx + i <= max_token_idx else 0.0 for i in range(1, fut_ts + 1)],
         dtype=np.float32)
-    positions = relative_positions_in_current(poses_lidar, frame_idx, indices)
+    current_pose_idx = token_pose_indices[frame_idx]
+    positions = relative_positions_in_current(poses_lidar, current_pose_idx, pose_indices)
     fut = (positions[1:] - positions[:-1])[:, :2].astype(np.float32)
     fut[masks == 0] = 0.0
     return fut, masks
@@ -234,11 +252,13 @@ def build_minimal_frame_info(
     sequence_dir = osp.join(data_root, 'sequences', sequence)
     tokens = list_frame_tokens(sequence_dir)
     poses_lidar = load_lidar_poses(data_root, sequence)
+    token_pose_indices = [token_to_pose_index(token) for token in tokens]
     return build_frame_info_from_cache(
         data_root=data_root,
         ann_file=ann_file,
         sequence=sequence,
         tokens=tokens,
+        token_pose_indices=token_pose_indices,
         poses_lidar=poses_lidar,
         frame_idx=frame_idx,
         fut_ts=fut_ts,
@@ -251,6 +271,7 @@ def build_frame_info_from_cache(
         ann_file,
         sequence,
         tokens,
+        token_pose_indices,
         poses_lidar,
         frame_idx,
         fut_ts,
@@ -265,18 +286,24 @@ def build_frame_info_from_cache(
     #* - 连续 N 帧只在内存中按 frame_idx 取对应元素，不再重复扫描网络盘目录。
     """
     sequence_dir = osp.join(data_root, 'sequences', sequence)
-    num_frames = min(len(tokens), len(poses_lidar))
+    num_frames = min(len(tokens), len(token_pose_indices))
     if frame_idx < 0 or frame_idx >= num_frames:
         raise IndexError(f'frame_idx={frame_idx} out of range [0, {num_frames - 1}]')
 
     token = tokens[frame_idx]
+    pose_idx = token_pose_indices[frame_idx]
+    if pose_idx < 0 or pose_idx >= len(poses_lidar):
+        raise IndexError(
+            f'token={token} maps to pose index {pose_idx}, but poses.txt has '
+            f'{len(poses_lidar)} poses.')
     prev_token = tokens[frame_idx - 1] if frame_idx > 0 else ''
     next_token = tokens[frame_idx + 1] if frame_idx + 1 < num_frames else ''
     scene_name = f'sequence-{sequence}'
-    pose = poses_lidar[frame_idx]
+    pose = poses_lidar[pose_idx]
 
-    gt_ego_his_trajs = build_history_trajs(poses_lidar, frame_idx, his_ts)
-    gt_ego_fut_trajs, gt_ego_fut_masks = build_future_trajs(poses_lidar, frame_idx, fut_ts)
+    gt_ego_his_trajs = build_history_trajs(poses_lidar, token_pose_indices, frame_idx, his_ts)
+    gt_ego_fut_trajs, gt_ego_fut_masks = build_future_trajs(
+        poses_lidar, token_pose_indices, frame_idx, fut_ts)
     gt_ego_fut_cmd = build_pseudo_command(gt_ego_fut_trajs, cmd_thresh)
 
     #* 与 FoundationSSC 完全一致的 dense occupancy 路径：
@@ -296,8 +323,9 @@ def build_frame_info_from_cache(
         'prev': prev_token,  # 同一sequence内上一帧token；首帧为空
         'next': next_token,  # 同一sequence内下一帧token；末帧为空
         'frame_idx': frame_idx,  # 当前帧在sequence内的整数编号
+        'pose_idx': pose_idx,  # 当前token在poses.txt中的真实行号；例如token=000110 -> pose_idx=110
         'scene_token': scene_name,  # 用sequence名代替nuScenes scene token
-        'timestamp': int(frame_idx),  # 最小示例用frame_idx作为伪时间戳
+        'timestamp': int(pose_idx),  # 最小示例用pose_idx作为伪时间戳，更贴近原始连续帧编号
         'map_location': 'semantickitti',  # 占位字段，保持接口兼容
 
         #*==================== 2. 当前帧位姿和标定 ====================#
@@ -314,7 +342,7 @@ def build_frame_info_from_cache(
         'pose_mode': gt_ego_fut_cmd.copy(),  # OccWorld dataset实际读取该字段
 
         #*==================== 4. 可选/占位字段 ====================#
-        'fut_valid_flag': bool(frame_idx + fut_ts < num_frames),  # 是否有完整未来fut_ts帧
+        'fut_valid_flag': bool(frame_idx + fut_ts < num_frames),  # 是否有完整未来fut_ts个occupancy关键帧
         'cams': {},  # SemanticKITTI LiDAR-only最小样本可先置空
         'sweeps': [],  # 如不使用多帧sweep，可先置空
     }
@@ -365,7 +393,12 @@ def build_window_infos(
     #* 下面两步是构造连续片段时最容易变慢的文件系统操作，因此只执行一次。
     tokens = list_frame_tokens(osp.join(data_root, 'sequences', sequence))
     poses_lidar = load_lidar_poses(data_root, sequence)
-    total_frames = min(len(tokens), len(poses_lidar))
+    token_pose_indices = [token_to_pose_index(token) for token in tokens]
+    if token_pose_indices and max(token_pose_indices) >= len(poses_lidar):
+        raise IndexError(
+            f'Max token pose index {max(token_pose_indices)} exceeds poses.txt length '
+            f'{len(poses_lidar)}. Please check sequence {sequence} tokens/poses.')
+    total_frames = min(len(tokens), len(token_pose_indices))
     end_frame_idx = start_frame_idx + num_frames
     if start_frame_idx < 0 or start_frame_idx >= total_frames:
         raise IndexError(
@@ -386,6 +419,7 @@ def build_window_infos(
             ann_file=ann_file,
             sequence=sequence,
             tokens=tokens,
+            token_pose_indices=token_pose_indices,
             poses_lidar=poses_lidar,
             frame_idx=i,
             fut_ts=fut_ts,
