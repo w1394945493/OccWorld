@@ -874,54 +874,60 @@ def _fill_trainval_infos(nusc,
             info['gt_ego_fut_cmd'] = command.astype(np.float32)  # (3,)，[右转, 左转, 直行] one-hot
             info['gt_ego_lcf_feat'] = ego_lcf_feat.astype(np.float32)  # (9,)，自车低层运动/控制特征
 
+        #*==================== 当前帧 info 字段总览 ====================#
+        #* info 是一个 nuScenes 关键帧 sample 的完整元数据和监督标签；此时 train/val 列表
+        #* 仍然以“帧/sample”为单位存放，后续 convert_to_occworld_infos() 才会按 scene-xxxx 分组。
+        #*
+        #* 1. 当前帧基础信息：
+        #*   lidar_path: 当前帧 LIDAR_TOP 点云文件路径。
+        #*   token: 当前 nuScenes sample token，也是拼接 Occ3D labels.npz 路径的帧目录名。
+        #*   prev / next: 当前场景内上一帧/下一帧 sample token；场景首尾为空字符串。
+        #*   can_bus: 当前帧 18 维 CAN bus 状态，主要用于自车状态和运动信息补充。
+        #*   frame_idx: 当前帧在所属场景中的递增编号；遇到场景末帧后重置。
+        #*   scene_token: 当前帧所属 nuScenes scene 的 UUID；后面会映射为 scene-xxxx。
+        #*   timestamp: 当前关键帧时间戳，单位为 nuScenes 原始微秒。
+        #*   map_location: 当前场景所在地图区域，例如 boston-seaport / singapore-onenorth。
+        #*
+        #* 2. 当前帧位姿和标定：
+        #*   lidar2ego_translation / lidar2ego_rotation: 当前 LIDAR_TOP -> ego 的外参。
+        #*   ego2global_translation / ego2global_rotation: 当前 ego -> global 的位姿。
+        #*
+        #* 3. 多相机信息：
+        #*   cams: 六路相机字典，包含图像路径、相机到当前 LiDAR_TOP 的外参、相机内参等。
+        #*
+        #* 4. 历史 LiDAR sweep：
+        #*   sweeps: 历史 LIDAR_TOP sample_data 及其到当前帧 LIDAR_TOP 的变换。
+        #*
+        #* 5. 当前帧目标检测标签：
+        #*   gt_boxes: (N,7)，当前帧目标 3D 框，[x,y,z,w,l,h,yaw]，LiDAR 坐标系。
+        #*   gt_names: (N,)，目标类别名，已映射到 nuScenes 检测常用类别。
+        #*   gt_velocity: (N,2)，目标速度，已旋转到当前 LiDAR 坐标系。
+        #*   num_lidar_pts / num_radar_pts: (N,)，每个目标框内的 LiDAR/Radar 点数。
+        #*   valid_flag: (N,)，目标是否有效；通常要求 LiDAR 点数 + Radar 点数 > 0。
+        #*
+        #* 6. 周围目标未来轨迹标签，用于描述当前帧每个 agent 未来约 3 秒运动：
+        #*   gt_agent_fut_trajs: (N,12)，未来 6 步二维逐步位移展平后的结果。
+        #*   gt_agent_fut_masks: (N,6)，未来 6 步目标标注是否有效。
+        #*   gt_agent_lcf_feat: (N,9)，目标当前位置、yaw、速度、尺寸、类别等低层特征。
+        #*   gt_agent_fut_yaw: (N,6)，未来 6 步相邻时刻 yaw 增量。
+        #*   gt_agent_fut_goal: (N,)，根据未来运动方向量化得到的 goal 类别。
+        #*
+        #* 7. 自车历史/未来轨迹标签：
+        #*   gt_ego_his_trajs: (2,2)，自车历史 2 步逐步位移。
+        #*   gt_ego_fut_trajs: (6,2)，自车未来 6 步逐步位移，约 3 秒。
+        #*   gt_ego_fut_masks: (6,)，未来 6 步自车轨迹是否有效。
+        #*   gt_ego_fut_cmd: (3,)，右转/左转/直行 one-hot；后续会复制为 OccWorld 的 pose_mode。
+        #*   gt_ego_lcf_feat: (9,)，速度、加速度、yaw rate、车辆尺寸、速度、曲率等自车状态。
+        #*
+        #* 8. 未来有效性：
+        #*   fut_valid_flag: bool，表示从当前帧往后是否有足够 fut_ts 个未来关键帧可用。
+
+        # *==========================================================================#
         # *14. 按 scene token 将完整 info 放入 train 或 val 列表，防止同一场景跨数据划分。
-        if sample['scene_token'] in train_scenes: # 最初按 帧/sample 为单位存放的list
-            train_nusc_infos.append(info) # info: 一个nuScens关键帧sample的完整元数据和监督标签。包括：1.基础信息 2.当前位姿和标定 3.多相机相机 4.历史lidar sweep 5.当前帧目标检测标签 6.周围目标未来轨迹标签 7.自车历史/未来轨迹标签 8.未来有效性
+        if sample['scene_token'] in train_scenes:
+            train_nusc_infos.append(info)
         else:
             val_nusc_infos.append(info)
-        """
-        info: 一个 nuScenes 关键帧 sample 的完整元数据和监督标签。
-        1.当前帧基础信息
-        lidar_path: 当前帧 LiDAR 文件路径。
-        token
-        prev
-        next
-        can_bus
-        frame_idx
-        scene_token
-        timestamp
-        map_location
-        2. 当前帧位姿和标定
-        lidar2ego_translation: (3,)
-        lidar2ego_rotation: (4,)
-        ego2global_translation
-        ego2global_rotation
-        3. 多相机信息
-        cams: 包含六路相机，包含图像文件路径、cam2lidar位姿、相机内参
-        4. 历史 LiDAR sweep
-        sweeps
-        5. 当前帧目标检测标签
-        gt_boxes: (num 7)
-        gt_names: (num,)
-        gt_velocity: (num,2)
-        num_lidar_pts: (num,)
-        num_radar_pts: (num,)
-        valid_flag:(num,)
-        6. 周围目标未来轨迹标签: 用于描述当前帧每个 agent 未来约 3 秒的运动。
-        gt_agent_fut_trajs: (num,12)
-        gt_agent_fut_masks: (num,6)
-        gt_agent_lcf_feat: (num,9)
-        gt_agent_fut_yaw: (num,6)
-        gt_agent_fut_goal: (num,)
-        7. 自车历史/未来轨迹标签
-        gt_ego_his_trajs: (2 2) 自车历史逐步位移；
-        gt_ego_fut_trajs: (6 2) 自车未来 6 步逐步位移；
-        gt_ego_fut_masks: (6) 
-        gt_ego_fut_cmd:  (3,) 右转 / 左转 / 直行 one-hot；
-        gt_ego_lcf_feat: (9,) 速度、加速度、yaw rate、曲率等自车状态。
-        8. 未来有效性
-        fut_valid_flag: bool 表示从当前帧往后是否有足够未来帧可用。
-        """
 
     return train_nusc_infos, val_nusc_infos
 
