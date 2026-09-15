@@ -22,6 +22,8 @@ import argparse
 import os
 import os.path as osp
 import pickle
+import sys
+import time
 
 import numpy as np
 
@@ -48,6 +50,9 @@ def parse_args():
                         help='lateral threshold in meters for pseudo command')
     parser.add_argument('--out-pkl', default='',
                         help='optional output pkl path for a minimal infos dict')
+    parser.add_argument('--check-occ-files', action='store_true',
+                        help=('check whether each dense occupancy .npy exists; disabled by default '
+                              'because per-frame file stat can be slow on network filesystems'))
     return parser.parse_args()
 
 
@@ -146,9 +151,10 @@ def list_frame_tokens(sequence_dir):
     voxel_dir = osp.join(sequence_dir, 'voxels')
     if not osp.isdir(voxel_dir):
         raise FileNotFoundError(f'Missing voxels directory: {voxel_dir}')
+    #* 使用 os.scandir 比 os.listdir + 多次路径处理更轻量；只读取目录项名称，不读取点云内容。
     tokens = sorted(
-        osp.splitext(name)[0] for name in os.listdir(voxel_dir)
-        if name.endswith('.bin'))
+        osp.splitext(entry.name)[0] for entry in os.scandir(voxel_dir)
+        if entry.is_file() and entry.name.endswith('.bin'))
     if not tokens:
         raise RuntimeError(f'No .bin files found in {voxel_dir}')
     return tokens
@@ -219,11 +225,46 @@ def build_minimal_frame_info(
         fut_ts=6,
         his_ts=2,
         cmd_thresh=2.0):
-    """加载 SemanticKITTI 数据并构造一个真实帧的最小 OccWorld 风格 info。"""
+    """加载 SemanticKITTI 数据并构造一个真实帧的最小 OccWorld 风格 info。
+
+    #! 该函数适合单帧调试；如果要批量构造连续帧，请使用 build_window_infos。
+    #! build_window_infos 会复用 tokens/poses，避免每一帧都重复扫描目录和读取位姿。
+    """
     ann_file = resolve_ann_file(data_root)
     sequence_dir = osp.join(data_root, 'sequences', sequence)
     tokens = list_frame_tokens(sequence_dir)
     poses_lidar = load_lidar_poses(data_root, sequence)
+    return build_frame_info_from_cache(
+        data_root=data_root,
+        ann_file=ann_file,
+        sequence=sequence,
+        tokens=tokens,
+        poses_lidar=poses_lidar,
+        frame_idx=frame_idx,
+        fut_ts=fut_ts,
+        his_ts=his_ts,
+        cmd_thresh=cmd_thresh)
+
+
+def build_frame_info_from_cache(
+        data_root,
+        ann_file,
+        sequence,
+        tokens,
+        poses_lidar,
+        frame_idx,
+        fut_ts,
+        his_ts,
+        cmd_thresh,
+        check_occ_files=False):
+    """基于已缓存的 tokens/poses 构造单帧 info，避免批量构建时重复 IO。
+
+    #* 性能关键点：
+    #* - tokens 来自一次 os.listdir(<seq>/voxels)；
+    #* - poses_lidar 来自一次 calib.txt/poses.txt 读取；
+    #* - 连续 N 帧只在内存中按 frame_idx 取对应元素，不再重复扫描网络盘目录。
+    """
+    sequence_dir = osp.join(data_root, 'sequences', sequence)
     num_frames = min(len(tokens), len(poses_lidar))
     if frame_idx < 0 or frame_idx >= num_frames:
         raise IndexError(f'frame_idx={frame_idx} out of range [0, {num_frames - 1}]')
@@ -241,11 +282,16 @@ def build_minimal_frame_info(
     #* 与 FoundationSSC 完全一致的 dense occupancy 路径：
     #*   ann_file / sequence / (frame_id + '_1_1.npy')
     voxel_path = osp.join(ann_file, sequence, f'{token}_1_1.npy')
+    if check_occ_files and not osp.isfile(voxel_path):
+        raise FileNotFoundError(
+            f'Missing dense occupancy file: {voxel_path}. '
+            'Expected FoundationSSC path <data-root>/labels/<seq>/<frame_id>_1_1.npy.')
     info = {
         #*==================== 1. 当前帧基础信息 ====================#
         'lidar_path': osp.join(sequence_dir, 'velodyne', f'{token}.bin'),  # 当前LiDAR点云路径
-        'voxel_path': voxel_path if osp.isfile(voxel_path) else None,  # FoundationSSC dense occupancy GT
-        'occ_path': voxel_path if osp.isfile(voxel_path) else None,  # 可视化脚本优先读取该字段
+        #* 这里直接写入确定性路径，不默认逐帧 osp.isfile 检查；网络盘上大量 stat 会明显拖慢 converter。
+        'voxel_path': voxel_path,  # FoundationSSC dense occupancy GT
+        'occ_path': voxel_path,  # 可视化脚本优先读取该字段
         'token': token,  # 当前帧ID；例如000000
         'prev': prev_token,  # 同一sequence内上一帧token；首帧为空
         'next': next_token,  # 同一sequence内下一帧token；末帧为空
@@ -275,8 +321,15 @@ def build_minimal_frame_info(
     return info
 
 
-def build_sequence_infos(data_root, sequence, fut_ts, his_ts, cmd_thresh):
+def build_sequence_infos(
+        data_root,
+        sequence,
+        fut_ts,
+        his_ts,
+        cmd_thresh,
+        check_occ_files=False):
     """为一个 sequence 的所有 FoundationSSC 帧构造最小 info 列表。"""
+    #! 只扫描一次 tokens，用于确定该 sequence 的总帧数；真正构建 info 时也会复用。
     tokens = list_frame_tokens(osp.join(data_root, 'sequences', sequence))
     return build_window_infos(
         data_root=data_root,
@@ -285,7 +338,8 @@ def build_sequence_infos(data_root, sequence, fut_ts, his_ts, cmd_thresh):
         num_frames=len(tokens),
         fut_ts=fut_ts,
         his_ts=his_ts,
-        cmd_thresh=cmd_thresh)
+        cmd_thresh=cmd_thresh,
+        check_occ_files=check_occ_files)
 
 
 def build_window_infos(
@@ -295,7 +349,8 @@ def build_window_infos(
         num_frames,
         fut_ts,
         his_ts,
-        cmd_thresh):
+        cmd_thresh,
+        check_occ_files=False):
     """为一个 sequence 中的连续窗口构造 info 列表。
 
     #! 这里的“场景”不是重新切分 SemanticKITTI，而是在同一个 sequence 内截取
@@ -305,6 +360,9 @@ def build_window_infos(
     """
     if num_frames <= 0:
         raise ValueError(f'num_frames must be positive, got {num_frames}')
+    ann_file = resolve_ann_file(data_root)
+    sequence_dir = osp.join(data_root, 'sequences', sequence)
+    #* 下面两步是构造连续片段时最容易变慢的文件系统操作，因此只执行一次。
     tokens = list_frame_tokens(osp.join(data_root, 'sequences', sequence))
     poses_lidar = load_lidar_poses(data_root, sequence)
     total_frames = min(len(tokens), len(poses_lidar))
@@ -317,16 +375,31 @@ def build_window_infos(
             f'Requested window [{start_frame_idx}, {end_frame_idx}) exceeds '
             f'sequence length {total_frames}. Please reduce --num-frames or '
             f'use a smaller --frame-idx.')
-    return [
-        build_minimal_frame_info(
+    print(f'Loaded sequence {sequence}: {len(tokens)} frame tokens, '
+          f'{len(poses_lidar)} poses; building window '
+          f'[{start_frame_idx}, {end_frame_idx})')
+    infos = []
+    t_start = time.time()
+    for offset, i in enumerate(range(start_frame_idx, end_frame_idx), 1):
+        infos.append(build_frame_info_from_cache(
             data_root=data_root,
+            ann_file=ann_file,
             sequence=sequence,
+            tokens=tokens,
+            poses_lidar=poses_lidar,
             frame_idx=i,
             fut_ts=fut_ts,
             his_ts=his_ts,
-            cmd_thresh=cmd_thresh)
-        for i in range(start_frame_idx, end_frame_idx)
-    ]
+            cmd_thresh=cmd_thresh,
+            check_occ_files=check_occ_files))
+        #* 连续片段通常很快；构造长sequence时每100帧刷新一次进度，避免终端看起来无响应。
+        if offset == 1 or offset == num_frames or offset % 100 == 0:
+            elapsed = time.time() - t_start
+            fps = offset / max(elapsed, 1e-6)
+            print(f'\rBuilding infos: {offset}/{num_frames} '
+                  f'({fps:.1f} frame/s)', end='', file=sys.stderr, flush=True)
+    print('', file=sys.stderr)
+    return infos
 
 
 def dump_minimal_pkl(
@@ -375,7 +448,8 @@ def main():
             sequence=args.sequence,
             fut_ts=args.fut_ts,
             his_ts=args.his_ts,
-            cmd_thresh=args.cmd_thresh)
+            cmd_thresh=args.cmd_thresh,
+            check_occ_files=args.check_occ_files)
         print(f'Built {len(infos)} infos for {scene_name}')
         print_info(infos[0])
         start_frame_idx = 0
@@ -387,7 +461,8 @@ def main():
             num_frames=args.num_frames,
             fut_ts=args.fut_ts,
             his_ts=args.his_ts,
-            cmd_thresh=args.cmd_thresh)
+            cmd_thresh=args.cmd_thresh,
+            check_occ_files=args.check_occ_files)
         print(f'Built {len(infos)} consecutive infos for {scene_name}: '
               f'[{args.frame_idx}, {args.frame_idx + args.num_frames})')
         print_info(infos[0])

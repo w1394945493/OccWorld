@@ -22,6 +22,8 @@ import argparse
 import os
 import os.path as osp
 import pickle
+import sys
+import time
 
 import cv2
 import numpy as np
@@ -94,6 +96,26 @@ def parse_args():
     return parser.parse_args()
 
 
+def progress_iter(iterable, total, desc='Progress'):
+    """优先使用 tqdm；环境没有 tqdm 时退化为轻量级终端进度条。"""
+    try:
+        from tqdm import tqdm
+        yield from tqdm(iterable, total=total, desc=desc)
+        return
+    except Exception:
+        pass
+
+    t_start = time.time()
+    for idx, item in enumerate(iterable, 1):
+        elapsed = time.time() - t_start
+        fps = idx / max(elapsed, 1e-6)
+        eta = (total - idx) / max(fps, 1e-6)
+        print(f'\r{desc}: {idx}/{total} | {fps:.1f} frame/s | ETA {eta:.1f}s',
+              end='', file=sys.stderr, flush=True)
+        yield item
+    print('', file=sys.stderr)
+
+
 def load_pkl(path):
     with open(path, 'rb') as f:
         return pickle.load(f)
@@ -127,6 +149,11 @@ def pose_matrix(info):
 def scene_trajectory_in_current(infos, current_idx):
     """把整个 scene 的自车位置统一变换到当前帧局部坐标系，用于叠加轨迹。"""
     poses = [pose_matrix(info) for info in infos]
+    return scene_trajectory_from_pose_cache(poses, current_idx)
+
+
+def scene_trajectory_from_pose_cache(poses, current_idx):
+    """基于已缓存的4x4位姿，把整个scene轨迹变换到当前帧局部坐标系。"""
     global_to_current = np.linalg.inv(poses[current_idx])
     origin = np.asarray([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
     traj = np.stack([(global_to_current @ pose @ origin)[:2] for pose in poses])
@@ -204,7 +231,7 @@ def occupancy_to_bev(occ, empty_labels):
     return bev
 
 
-def render_frame(occ, infos, frame_idx, scene_name, occ_path, args):
+def render_frame(occ, infos, frame_idx, scene_name, occ_path, traj, args):
     """渲染单帧 BEV occupancy + 当前局部坐标系下的自车轨迹。"""
     bev = occupancy_to_bev(occ, args.empty_labels)
     xmin, ymin, _, xmax, ymax, _ = args.pc_range
@@ -218,7 +245,6 @@ def render_frame(occ, infos, frame_idx, scene_name, occ_path, args):
     ax.imshow(bev.T, origin='lower', extent=[xmin, xmax, ymin, ymax],
               interpolation='nearest', cmap=cmap, norm=norm, alpha=0.88)
 
-    traj = scene_trajectory_in_current(infos, frame_idx)
     ax.plot(traj[:frame_idx + 1, 0], traj[:frame_idx + 1, 1],
             '-o', color='#0066ff', linewidth=2, markersize=3, label='ego history')
     ax.plot(traj[frame_idx:, 0], traj[frame_idx:, 1],
@@ -257,12 +283,18 @@ def visualize_scene(scene_name, infos, args, data_root):
     if args.save_frames:
         os.makedirs(frames_dir, exist_ok=True)
     video_path = osp.join(scene_dir, 'bev.mp4')
+    #* 位姿矩阵只和pkl元数据有关，先缓存一次；避免每渲染一帧都重复解析四元数和构造矩阵。
+    poses = [pose_matrix(info) for info in infos]
+    total = len(infos)
 
     writer = None
     try:
-        for frame_idx, info in enumerate(infos):
+        iterator = enumerate(infos)
+        for frame_idx, info in progress_iter(iterator, total=total, desc=f'Visualizing {scene_name}'):
             occ, occ_path = load_occupancy(info, scene_name, data_root)
-            rgb = render_frame(occ, infos, frame_idx, scene_name, occ_path, args)
+            #* 每一帧都以“当前帧自车”为原点，因此轨迹需要变换到当前帧局部坐标系。
+            traj = scene_trajectory_from_pose_cache(poses, frame_idx)
+            rgb = render_frame(occ, infos, frame_idx, scene_name, occ_path, traj, args)
             if writer is None:
                 height, width = rgb.shape[:2]
                 writer = cv2.VideoWriter(
