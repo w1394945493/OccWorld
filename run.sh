@@ -61,3 +61,19 @@ cd /vepfs-mlp2/c20250502/haoce/wangyushen/OccWorld/
 . /root/miniconda3/bin/activate
 conda activate /vepfs-mlp2/c20250502/haoce/wangyushen/conda_env/wangyushentemp
 bash sh/train_stage2.sh
+
+
+# ===================================================================================#
+# semantic kitti
+python3 tools/semantickitti_converter.py \
+  --data-root /c20250502/wangyushen/Datasets/kitti/semantickitti/dataset \
+  --sequence 00 \
+  --frame-idx 100 \
+  --out-pkl out/semkitti/semantickitti_minimal_info.pkl
+
+python3 tools/visualize_semantickitti_pkl_bev.py \
+  --pkl out/semkitti/semantickitti_minimal_info.pkl \
+  --output-dir out/semantickitti_vis \
+  --scene sequence-00 \
+  --max-frames 100 \
+  --save-frames
