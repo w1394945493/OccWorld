@@ -11,7 +11,9 @@
 
 说明：
   - 本脚本面向 dense occupancy / SSC 标签，不适合直接可视化原始点云语义
-    labels/*.label，除非该 .label 文件本身就是 H*W*D 展平后的体素标签。
+  labels/*.label，除非该 .label 文件本身就是 H*W*D 展平后的体素标签。
+  若你的 dense occupancy 是 .npy，例如 dataset/labels/00/000000.npy，
+  可直接将 --occ-root 指向 dataset/labels/00 或 dataset/labels。
 """
 
 import argparse
@@ -68,7 +70,7 @@ def parse_args():
     parser.add_argument('--pkl', required=True, help='OccWorld-style pkl path')
     parser.add_argument('--output-dir', required=True, help='output directory')
     parser.add_argument('--occ-root', default='',
-                        help='dense occupancy root; used when info has no occ_path')
+                        help='dense occupancy root; used when info has no occ_path; supports .npy/.npz/.label')
     parser.add_argument('--scene', default='',
                         help='scene key to visualize, e.g. sequence-00; empty means all scenes')
     parser.add_argument('--max-frames', type=int, default=-1,
@@ -77,7 +79,7 @@ def parse_args():
     parser.add_argument('--save-frames', action='store_true', help='also save png frames')
     parser.add_argument('--occ-shape', type=int, nargs=3, default=[256, 256, 32],
                         metavar=('H', 'W', 'D'),
-                        help='dense occupancy shape for raw .label/.bin files')
+                        help='dense occupancy shape for raw .label/.bin files; .npy/.npz will use saved shape')
     parser.add_argument('--occ-dtype', default='uint16',
                         choices=['uint8', 'uint16', 'uint32', 'int32', 'int64'],
                         help='dtype for raw dense occupancy labels')
@@ -140,18 +142,24 @@ def candidate_occ_paths(info, scene_name, occ_root):
             candidates.append(path)
     if occ_root:
         candidates.extend([
+            osp.join(occ_root, f'{token}.npy'),  # occ-root直接指向 labels/00 时使用
+            osp.join(occ_root, f'{token}.npz'),
+            osp.join(occ_root, f'{token}.label'),
+            osp.join(occ_root, scene_name, f'{token}.npy'),
             osp.join(occ_root, scene_name, f'{token}.label'),
             osp.join(occ_root, scene_name, f'{token}.npz'),
             osp.join(occ_root, scene_name, token, 'labels.npz'),
+            osp.join(occ_root, sequence, f'{token}.npy'),  # occ-root指向 labels 时使用 labels/00/000000.npy
             osp.join(occ_root, sequence, f'{token}.label'),
             osp.join(occ_root, sequence, f'{token}.npz'),
+            osp.join(occ_root, 'sequences', sequence, 'labels', f'{token}.npy'),
             osp.join(occ_root, 'sequences', sequence, 'labels', f'{token}.label'),
         ])
     return candidates
 
 
 def load_occupancy(info, scene_name, args):
-    """加载单帧 dense occupancy，支持 npz 或展平 raw label/bin。"""
+    """加载单帧 dense occupancy，支持 npy、npz 或展平 raw label/bin。"""
     paths = candidate_occ_paths(info, scene_name, args.occ_root)
     existing = [path for path in paths if path and osp.isfile(path)]
     if not existing:
@@ -159,7 +167,9 @@ def load_occupancy(info, scene_name, args):
             f'Cannot find occupancy for scene={scene_name}, token={info["token"]}. '
             f'Checked candidates: {paths}')
     path = existing[0]
-    if path.endswith('.npz'):
+    if path.endswith('.npy'):
+        occ = np.load(path)
+    elif path.endswith('.npz'):
         data = np.load(path)
         for key in ['semantics', 'labels', 'label', 'occ', 'occupancy']:
             if key in data:
