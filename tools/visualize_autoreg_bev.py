@@ -109,7 +109,7 @@ def occupancy_to_bev(occupancy, free_label, unknown_label, ignore_label):
 
 
 def cumulative_trajectory(step_xy):
-    """将未来逐步位移(dx,dy)转换为从当前自车原点出发的累计轨迹。"""
+    """将未来逐步位移(dx,dy)转换为从当前参考点出发的累计轨迹。"""
     step_xy = np.asarray(step_xy, dtype=np.float64)
     if step_xy.ndim == 3:
         step_xy = step_xy[0]
@@ -117,6 +117,20 @@ def cumulative_trajectory(step_xy):
         return np.zeros((1, 2), dtype=np.float64)
     cum = np.cumsum(step_xy[:, :2], axis=0)
     return np.concatenate([np.zeros((1, 2), dtype=np.float64), cum], axis=0)
+
+
+def trajectory_lidar_to_ego_xy(traj_xy, meta):
+    """将当前LiDAR相对轨迹旋转到当前ego坐标系，便于与Occ3D BEV对齐。
+
+    注意这里不加lidar2ego的平移项：traj_xy是以当前LiDAR原点为零点的相对轨迹，
+    可视化也希望当前自车位置显示在(0,0)。因此只使用旋转部分完成坐标轴对齐。
+    """
+    traj_xy = np.asarray(traj_xy, dtype=np.float64)
+    lidar2ego = meta.get('lidar2ego', None)
+    if lidar2ego is None:
+        return traj_xy
+    rot = np.asarray(lidar2ego, dtype=np.float64)[:2, :2]
+    return traj_xy @ rot.T
 
 
 def draw_bev(ax, occupancy, title, gt_traj, pred_traj, frame_id, args):
@@ -235,14 +249,23 @@ def main():
     my_model, val_dataset_loader = build_model_and_loader(cfg, args, logger)
     os.environ['eval'] = 'true'
 
-    with torch.no_grad():
-        for i_iter_val, (input_occs, target_occs, metas) in enumerate(val_dataset_loader):
-            if i_iter_val not in args.scene_idx:
-                continue
-            if i_iter_val > max(args.scene_idx):
-                break
+    #* 直接按验证集Dataset索引取样，而不是像visualize_demo.py那样遍历整个DataLoader再continue。
+    #* val_dataset_loader.dataset是tpvformer_dataset_nuscenes包装后的Dataset，__getitem__返回单样本：
+    #*   input_occs: (F,H,W,D)，target_occs: (F,H,W,D)，meta: dict。
+    #* 模型仍然需要batch维和list形式metas，因此下面手动unsqueeze并包装成[meta]。
+    val_dataset = val_dataset_loader.dataset
+    invalid_scene_idx = [idx for idx in args.scene_idx if idx < 0 or idx >= len(val_dataset)]
+    if invalid_scene_idx:
+        raise IndexError(
+            f'--scene-idx包含越界索引{invalid_scene_idx}；'
+            f'当前验证集索引范围为[0, {len(val_dataset) - 1}]。')
 
-            input_occs = input_occs.cuda()
+    with torch.no_grad():
+        for i_iter_val in args.scene_idx:
+            input_occs, target_occs, meta = val_dataset[i_iter_val]
+            metas = [meta]
+
+            input_occs = input_occs.unsqueeze(0).cuda()
             result = my_model.forward_autoreg_with_pose(
                 x=input_occs,
                 metas=metas,
@@ -255,9 +278,11 @@ def main():
             pred_occs = to_numpy(result['sem_pred'][0])
             n_frames = min(len(gt_occs), len(pred_occs))
 
-            #* gt_poses_ / poses_均为未来逐步位移(dx,dy)，这里转成从当前帧出发的累计轨迹。
-            gt_traj = cumulative_trajectory(result['gt_poses_'][0])
-            pred_traj = cumulative_trajectory(to_numpy(result['poses_'][0]))
+            #* gt_poses_ / poses_均为未来逐步位移(dx,dy)，其坐标约定沿用converter保存的当前LiDAR系。
+            #* Occupancy BEV按当前ego坐标系绘制，因此这里先cumsum成累计轨迹，再用lidar2ego旋转到ego系。
+            #* 因为轨迹是相对位移，当前点仍固定画在(0,0)，所以不使用lidar2ego平移项。
+            gt_traj = trajectory_lidar_to_ego_xy(cumulative_trajectory(result['gt_poses_'][0]), meta)
+            pred_traj = trajectory_lidar_to_ego_xy(cumulative_trajectory(to_numpy(result['poses_'][0])), meta)
 
             sample_dir = osp.join(out_root, f'sample_{i_iter_val:04d}')
             frames_dir = osp.join(sample_dir, 'frames')
