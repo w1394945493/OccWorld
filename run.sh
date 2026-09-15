@@ -39,7 +39,14 @@ python train.py \
   --py-config /vepfs-mlp2/c20250502/haoce/wangyushen/OccWorld/config/train_occworld_debug.py \
   --work-dir out/occworld
 
+# 可视化
 
+python3 tools/visualize_autoreg_bev.py \
+  --py-config config/occworld_custom.py \
+  --work-dir ./out/occworld_custom \
+  --scene-idx 6 7 16 \
+  --fps 2 \
+  --save-frames
 
 # ========================================================#
 # stage1: VQ-VAE
