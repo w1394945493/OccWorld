@@ -79,6 +79,10 @@ def parse_args():
                         help='scene key to visualize, e.g. sequence-00; empty means all scenes')
     parser.add_argument('--max-frames', type=int, default=-1,
                         help='max frames per scene; negative means all frames')
+    parser.add_argument('--traj-his-steps', type=int, default=-1,
+                        help='history trajectory steps to draw; negative means all available history')
+    parser.add_argument('--traj-fut-steps', type=int, default=6,
+                        help='future trajectory steps to draw from current frame; negative means all remaining frames')
     parser.add_argument('--fps', type=float, default=5.0, help='output video FPS')
     parser.add_argument('--save-frames', action='store_true', help='also save png frames')
     parser.add_argument('--occ-shape', type=int, nargs=3, default=[256, 256, 32],
@@ -245,9 +249,15 @@ def render_frame(occ, infos, frame_idx, scene_name, occ_path, traj, args):
     ax.imshow(bev.T, origin='lower', extent=[xmin, xmax, ymin, ymax],
               interpolation='nearest', cmap=cmap, norm=norm, alpha=0.88)
 
-    ax.plot(traj[:frame_idx + 1, 0], traj[:frame_idx + 1, 1],
+    #* 轨迹可视化窗口：
+    #* - 默认历史轨迹画到当前片段起点；
+    #* - 默认未来轨迹只画当前帧之后 traj_fut_steps 步，避免把整个pkl剩余几十帧都画出来。
+    #* 如果希望看完整片段轨迹，可设置 --traj-fut-steps -1。
+    his_start = 0 if args.traj_his_steps < 0 else max(0, frame_idx - args.traj_his_steps)
+    fut_end = len(traj) if args.traj_fut_steps < 0 else min(len(traj), frame_idx + args.traj_fut_steps + 1)
+    ax.plot(traj[his_start:frame_idx + 1, 0], traj[his_start:frame_idx + 1, 1],
             '-o', color='#0066ff', linewidth=2, markersize=3, label='ego history')
-    ax.plot(traj[frame_idx:, 0], traj[frame_idx:, 1],
+    ax.plot(traj[frame_idx:fut_end, 0], traj[frame_idx:fut_end, 1],
             '-o', color='#ff6600', linewidth=2, markersize=3, label='ego future')
     ax.scatter([0], [0], marker='^', s=90, c='#00aa00', edgecolors='black',
                zorder=5, label='current ego')
