@@ -65,26 +65,17 @@ bash sh/train_stage2.sh
 
 # ===================================================================================#
 # semantic kitti
-# 构造 SemanticKITTI 最小 OccWorld 风格 pkl：
-#   - 只需提供 SemanticKITTI dataset 根目录；
-#   - dense occupancy 路径会按 FoundationSSC 规则自动推断为：
-#       <data-root>/labels/<sequence>/<frame_id>_1_1.npy
-#   - 从 sequence 00 的第100帧开始，连续保存100帧到同一个 scene(sequence-00) 中。
 python3 tools/semantickitti_converter.py \
   --data-root /c20250502/wangyushen/Datasets/kitti/semantickitti/dataset \
   --sequence 00 \
-  --frame-idx 100 \
-  --num-frames 100 \
-  --out-pkl out/semkitti/semantickitti_seq00_000100_100frames.pkl
+  --frame-idx 0 \
+  --num-frames 36 \
+  --out-pkl out/semkitti/semantickitti_seq00_000000.pkl \
 
-# 离线 BEV 可视化上述 pkl：
-#   - pkl metadata 已记录 data_root，因此这里无需再传 --data-root；
-#   - 输出 out/semantickitti_vis/sequence-00/bev.mp4；
-#   - 加 --save-frames 时，同时保存逐帧 png 到 frames/。
 python3 tools/visualize_semantickitti_pkl_bev.py \
-  --pkl out/semkitti/semantickitti_seq00_000100_100frames.pkl \
+  --pkl out/semkitti/semantickitti_seq00_000000.pkl \
   --output-dir out/semantickitti_vis \
   --scene sequence-00 \
-  --max-frames 100 \
+  --max-frames 36 \
   --fps 5 \
   --save-frames
