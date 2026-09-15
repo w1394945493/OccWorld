@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """SemanticKITTI -> OccWorld 风格最小 pkl 元数据构造示例。
 
-当前脚本先完成“单个最小 info 样本”的真实构建：
+当前脚本完成“一个 SemanticKITTI 场景/片段”的最小 info 构建：
 - 读取 FoundationSSC 使用的 SemanticKITTI 组织：
   <data_root>/sequences/<seq>/voxels/*.bin         # 用于确定帧 id
   <ann_file>/<seq>/<frame_id>_1_1.npy              # dense occupancy GT
   <data_root>/sequences/<seq>/poses.txt
   <data_root>/sequences/<seq>/calib.txt
 - 根据 poses.txt/calib.txt 计算每帧 LiDAR 在 global 中的位姿；
-- 为指定 sequence/frame 构造 OccWorld 风格 frame_info；
+- 为指定 sequence/frame 或指定连续窗口构造 OccWorld 风格 frame_info；
 - 可选保存一个最小 pkl：
-  {"infos": {"sequence-00": [frame_info]}, "metadata": {...}}
+  {"infos": {"sequence-00": [frame_info, ...]}, "metadata": {...}}
 
 注意：
 1) 这个最小 info 主要面向 occupancy forecasting，不包含 3D bbox / agent 轨迹；
@@ -35,9 +35,13 @@ def parse_args():
     parser.add_argument('--data-root', default=DEFAULT_DATA_ROOT,
                         help='SemanticKITTI dataset root, usually ending with /dataset')
     parser.add_argument('--sequence', default='00', help='SemanticKITTI sequence id, e.g. 00')
-    parser.add_argument('--frame-idx', type=int, default=0, help='frame index in the sequence')
+    parser.add_argument('--frame-idx', type=int, default=0,
+                        help='start frame index in the sequence')
+    parser.add_argument('--num-frames', type=int, default=1,
+                        help=('number of consecutive frames to save from --frame-idx; '
+                              'ignored when --all-frames is set'))
     parser.add_argument('--all-frames', action='store_true',
-                        help='build infos for all frames in the sequence instead of one frame')
+                        help='build infos for all frames in the sequence instead of a fixed window')
     parser.add_argument('--fut-ts', type=int, default=6, help='future steps, default 6')
     parser.add_argument('--his-ts', type=int, default=2, help='history steps, default 2')
     parser.add_argument('--cmd-thresh', type=float, default=2.0,
@@ -274,6 +278,45 @@ def build_minimal_frame_info(
 def build_sequence_infos(data_root, sequence, fut_ts, his_ts, cmd_thresh):
     """为一个 sequence 的所有 FoundationSSC 帧构造最小 info 列表。"""
     tokens = list_frame_tokens(osp.join(data_root, 'sequences', sequence))
+    return build_window_infos(
+        data_root=data_root,
+        sequence=sequence,
+        start_frame_idx=0,
+        num_frames=len(tokens),
+        fut_ts=fut_ts,
+        his_ts=his_ts,
+        cmd_thresh=cmd_thresh)
+
+
+def build_window_infos(
+        data_root,
+        sequence,
+        start_frame_idx,
+        num_frames,
+        fut_ts,
+        his_ts,
+        cmd_thresh):
+    """为一个 sequence 中的连续窗口构造 info 列表。
+
+    #! 这里的“场景”不是重新切分 SemanticKITTI，而是在同一个 sequence 内截取
+    #! [start_frame_idx, start_frame_idx + num_frames) 这段连续帧保存到同一个
+    #! pkl scene key 下，方便 OccWorld 风格 dataset/可视化按时间顺序读取。
+    #! 每个 info 仍然是“单帧元数据”，列表顺序就是后续视频可视化和时序建模顺序。
+    """
+    if num_frames <= 0:
+        raise ValueError(f'num_frames must be positive, got {num_frames}')
+    tokens = list_frame_tokens(osp.join(data_root, 'sequences', sequence))
+    poses_lidar = load_lidar_poses(data_root, sequence)
+    total_frames = min(len(tokens), len(poses_lidar))
+    end_frame_idx = start_frame_idx + num_frames
+    if start_frame_idx < 0 or start_frame_idx >= total_frames:
+        raise IndexError(
+            f'frame_idx={start_frame_idx} out of range [0, {total_frames - 1}]')
+    if end_frame_idx > total_frames:
+        raise IndexError(
+            f'Requested window [{start_frame_idx}, {end_frame_idx}) exceeds '
+            f'sequence length {total_frames}. Please reduce --num-frames or '
+            f'use a smaller --frame-idx.')
     return [
         build_minimal_frame_info(
             data_root=data_root,
@@ -282,12 +325,19 @@ def build_sequence_infos(data_root, sequence, fut_ts, his_ts, cmd_thresh):
             fut_ts=fut_ts,
             his_ts=his_ts,
             cmd_thresh=cmd_thresh)
-        for i in range(len(tokens))
+        for i in range(start_frame_idx, end_frame_idx)
     ]
 
 
-def dump_minimal_pkl(infos, scene_name, out_pkl, data_root):
-    """保存最小 pkl，infos 可以是一帧或一个 sequence。"""
+def dump_minimal_pkl(
+        infos,
+        scene_name,
+        out_pkl,
+        data_root,
+        sequence,
+        start_frame_idx,
+        num_frames):
+    """保存最小 pkl，infos 可以是一帧、一个连续窗口或完整 sequence。"""
     os.makedirs(osp.dirname(osp.abspath(out_pkl)), exist_ok=True)
     data = {
         'infos': {scene_name: infos},
@@ -296,6 +346,9 @@ def dump_minimal_pkl(infos, scene_name, out_pkl, data_root):
             'version': 'foundation_ssc_style_minimal',
             'data_root': osp.abspath(data_root),
             'ann_file': osp.join(osp.abspath(data_root), 'labels'),
+            'sequence': sequence,
+            'start_frame_idx': int(start_frame_idx),
+            'num_frames': int(num_frames),
             'note': 'Dense occupancy path follows FoundationSSC: ann_file/seq/frame_id_1_1.npy.',
         },
     }
@@ -325,18 +378,29 @@ def main():
             cmd_thresh=args.cmd_thresh)
         print(f'Built {len(infos)} infos for {scene_name}')
         print_info(infos[0])
+        start_frame_idx = 0
     else:
-        info = build_minimal_frame_info(
+        infos = build_window_infos(
             data_root=args.data_root,
             sequence=args.sequence,
-            frame_idx=args.frame_idx,
+            start_frame_idx=args.frame_idx,
+            num_frames=args.num_frames,
             fut_ts=args.fut_ts,
             his_ts=args.his_ts,
             cmd_thresh=args.cmd_thresh)
-        infos = [info]
-        print_info(info)
+        print(f'Built {len(infos)} consecutive infos for {scene_name}: '
+              f'[{args.frame_idx}, {args.frame_idx + args.num_frames})')
+        print_info(infos[0])
+        start_frame_idx = args.frame_idx
     if args.out_pkl:
-        dump_minimal_pkl(infos, scene_name, args.out_pkl, args.data_root)
+        dump_minimal_pkl(
+            infos=infos,
+            scene_name=scene_name,
+            out_pkl=args.out_pkl,
+            data_root=args.data_root,
+            sequence=args.sequence,
+            start_frame_idx=start_frame_idx,
+            num_frames=len(infos))
         print(f'Wrote minimal pkl to: {args.out_pkl}')
 
 
