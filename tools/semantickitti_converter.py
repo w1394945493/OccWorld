@@ -2,9 +2,9 @@
 """SemanticKITTI -> OccWorld 风格最小 pkl 元数据构造示例。
 
 当前脚本先完成“单个最小 info 样本”的真实构建：
-- 读取 SemanticKITTI 标准目录：
-  <data_root>/sequences/<seq>/velodyne/*.bin
-  <data_root>/sequences/<seq>/labels/*.label
+- 读取 FoundationSSC 使用的 SemanticKITTI 组织：
+  <data_root>/sequences/<seq>/voxels/*.bin         # 用于确定帧 id
+  <ann_file>/<seq>/<frame_id>_1_1.npy              # dense occupancy GT
   <data_root>/sequences/<seq>/poses.txt
   <data_root>/sequences/<seq>/calib.txt
 - 根据 poses.txt/calib.txt 计算每帧 LiDAR 在 global 中的位姿；
@@ -14,8 +14,8 @@
 
 注意：
 1) 这个最小 info 主要面向 occupancy forecasting，不包含 3D bbox / agent 轨迹；
-2) SemanticKITTI 原始 labels/*.label 是点云语义标签，不一定是 dense occupancy。
-   真正训练 OccWorld 风格 VQ-VAE/World Model 时，还需要对应的 dense occupancy 标签读取逻辑。
+2) 这里不使用 SemanticKITTI 原始逐点 labels/*.label，而是使用 FoundationSSC 配置中的
+   ann_file=<data_root>/labels，确定性读取 <ann_file>/<seq>/<frame_id>_1_1.npy。
 """
 
 import argparse
@@ -36,6 +36,8 @@ def parse_args():
                         help='SemanticKITTI dataset root, usually ending with /dataset')
     parser.add_argument('--sequence', default='00', help='SemanticKITTI sequence id, e.g. 00')
     parser.add_argument('--frame-idx', type=int, default=0, help='frame index in the sequence')
+    parser.add_argument('--all-frames', action='store_true',
+                        help='build infos for all frames in the sequence instead of one frame')
     parser.add_argument('--fut-ts', type=int, default=6, help='future steps, default 6')
     parser.add_argument('--his-ts', type=int, default=2, help='history steps, default 2')
     parser.add_argument('--cmd-thresh', type=float, default=2.0,
@@ -43,6 +45,15 @@ def parse_args():
     parser.add_argument('--out-pkl', default='',
                         help='optional output pkl path for a minimal infos dict')
     return parser.parse_args()
+
+
+def resolve_ann_file(data_root):
+    """由数据集根目录确定 FoundationSSC dense occupancy 根目录。"""
+    ann_file = osp.join(data_root, 'labels')
+    if not osp.isdir(ann_file):
+        raise FileNotFoundError(
+            f'Cannot infer ann_file from data_root. Expected directory: {ann_file}')
+    return ann_file
 
 
 def read_calib(calib_path):
@@ -121,15 +132,21 @@ def rotation_matrix_to_quaternion_wxyz(rot):
 
 
 def list_frame_tokens(sequence_dir):
-    """根据 velodyne/*.bin 获取当前 sequence 的有序帧 token 列表。"""
-    velodyne_dir = osp.join(sequence_dir, 'velodyne')
-    if not osp.isdir(velodyne_dir):
-        raise FileNotFoundError(f'Missing velodyne directory: {velodyne_dir}')
+    """按 FoundationSSC 逻辑根据 voxels/*.bin 获取有序帧 token。
+
+    FoundationSSC 的 SemanticKITTIDataset.load_annotations() 默认扫描：
+      <data_root>/sequences/<seq>/voxels/*.bin
+    然后将同名 frame_id 映射到 dense occupancy：
+      <ann_file>/<seq>/<frame_id>_1_1.npy
+    """
+    voxel_dir = osp.join(sequence_dir, 'voxels')
+    if not osp.isdir(voxel_dir):
+        raise FileNotFoundError(f'Missing voxels directory: {voxel_dir}')
     tokens = sorted(
-        osp.splitext(name)[0] for name in os.listdir(velodyne_dir)
+        osp.splitext(name)[0] for name in os.listdir(voxel_dir)
         if name.endswith('.bin'))
     if not tokens:
-        raise RuntimeError(f'No .bin files found in {velodyne_dir}')
+        raise RuntimeError(f'No .bin files found in {voxel_dir}')
     return tokens
 
 
@@ -199,6 +216,7 @@ def build_minimal_frame_info(
         his_ts=2,
         cmd_thresh=2.0):
     """加载 SemanticKITTI 数据并构造一个真实帧的最小 OccWorld 风格 info。"""
+    ann_file = resolve_ann_file(data_root)
     sequence_dir = osp.join(data_root, 'sequences', sequence)
     tokens = list_frame_tokens(sequence_dir)
     poses_lidar = load_lidar_poses(data_root, sequence)
@@ -216,11 +234,14 @@ def build_minimal_frame_info(
     gt_ego_fut_trajs, gt_ego_fut_masks = build_future_trajs(poses_lidar, frame_idx, fut_ts)
     gt_ego_fut_cmd = build_pseudo_command(gt_ego_fut_trajs, cmd_thresh)
 
-    label_path = osp.join(sequence_dir, 'labels', f'{token}.label')
+    #* 与 FoundationSSC 完全一致的 dense occupancy 路径：
+    #*   ann_file / sequence / (frame_id + '_1_1.npy')
+    voxel_path = osp.join(ann_file, sequence, f'{token}_1_1.npy')
     info = {
         #*==================== 1. 当前帧基础信息 ====================#
         'lidar_path': osp.join(sequence_dir, 'velodyne', f'{token}.bin'),  # 当前LiDAR点云路径
-        'label_path': label_path if osp.isfile(label_path) else '',  # 原始点云语义标签路径；非dense occupancy
+        'voxel_path': voxel_path if osp.isfile(voxel_path) else None,  # FoundationSSC dense occupancy GT
+        'occ_path': voxel_path if osp.isfile(voxel_path) else None,  # 可视化脚本优先读取该字段
         'token': token,  # 当前帧ID；例如000000
         'prev': prev_token,  # 同一sequence内上一帧token；首帧为空
         'next': next_token,  # 同一sequence内下一帧token；末帧为空
@@ -250,16 +271,32 @@ def build_minimal_frame_info(
     return info
 
 
-def dump_minimal_pkl(info, out_pkl):
-    """保存一个只含单帧 info 的最小 pkl，便于检查结构。"""
+def build_sequence_infos(data_root, sequence, fut_ts, his_ts, cmd_thresh):
+    """为一个 sequence 的所有 FoundationSSC 帧构造最小 info 列表。"""
+    tokens = list_frame_tokens(osp.join(data_root, 'sequences', sequence))
+    return [
+        build_minimal_frame_info(
+            data_root=data_root,
+            sequence=sequence,
+            frame_idx=i,
+            fut_ts=fut_ts,
+            his_ts=his_ts,
+            cmd_thresh=cmd_thresh)
+        for i in range(len(tokens))
+    ]
+
+
+def dump_minimal_pkl(infos, scene_name, out_pkl, data_root):
+    """保存最小 pkl，infos 可以是一帧或一个 sequence。"""
     os.makedirs(osp.dirname(osp.abspath(out_pkl)), exist_ok=True)
-    scene_name = info['scene_token']
     data = {
-        'infos': {scene_name: [info]},
+        'infos': {scene_name: infos},
         'metadata': {
             'dataset': 'SemanticKITTI',
-            'version': 'minimal_single_frame',
-            'note': 'This pkl contains one minimal frame_info for structure inspection.',
+            'version': 'foundation_ssc_style_minimal',
+            'data_root': osp.abspath(data_root),
+            'ann_file': osp.join(osp.abspath(data_root), 'labels'),
+            'note': 'Dense occupancy path follows FoundationSSC: ann_file/seq/frame_id_1_1.npy.',
         },
     }
     with open(out_pkl, 'wb') as f:
@@ -278,16 +315,28 @@ def print_info(info):
 
 def main():
     args = parse_args()
-    info = build_minimal_frame_info(
-        data_root=args.data_root,
-        sequence=args.sequence,
-        frame_idx=args.frame_idx,
-        fut_ts=args.fut_ts,
-        his_ts=args.his_ts,
-        cmd_thresh=args.cmd_thresh)
-    print_info(info)
+    scene_name = f'sequence-{args.sequence}'
+    if args.all_frames:
+        infos = build_sequence_infos(
+            data_root=args.data_root,
+            sequence=args.sequence,
+            fut_ts=args.fut_ts,
+            his_ts=args.his_ts,
+            cmd_thresh=args.cmd_thresh)
+        print(f'Built {len(infos)} infos for {scene_name}')
+        print_info(infos[0])
+    else:
+        info = build_minimal_frame_info(
+            data_root=args.data_root,
+            sequence=args.sequence,
+            frame_idx=args.frame_idx,
+            fut_ts=args.fut_ts,
+            his_ts=args.his_ts,
+            cmd_thresh=args.cmd_thresh)
+        infos = [info]
+        print_info(info)
     if args.out_pkl:
-        dump_minimal_pkl(info, args.out_pkl)
+        dump_minimal_pkl(infos, scene_name, args.out_pkl, args.data_root)
         print(f'Wrote minimal pkl to: {args.out_pkl}')
 
 

@@ -12,8 +12,10 @@
 说明：
   - 本脚本面向 dense occupancy / SSC 标签，不适合直接可视化原始点云语义
   labels/*.label，除非该 .label 文件本身就是 H*W*D 展平后的体素标签。
-  若你的 dense occupancy 是 .npy，例如 dataset/labels/00/000000.npy，
-  可直接将 --occ-root 指向 dataset/labels/00 或 dataset/labels。
+  FoundationSSC 的确定性 dense occupancy 路径为：
+    <ann_file>/<sequence>/<frame_id>_1_1.npy
+  例如：
+    /c20250502/.../dataset/labels/00/000000_1_1.npy
 """
 
 import argparse
@@ -69,8 +71,8 @@ def parse_args():
         description='Visualize SemanticKITTI OccWorld-style pkl as BEV videos.')
     parser.add_argument('--pkl', required=True, help='OccWorld-style pkl path')
     parser.add_argument('--output-dir', required=True, help='output directory')
-    parser.add_argument('--occ-root', default='',
-                        help='dense occupancy root; used when info has no occ_path; supports .npy/.npz/.label')
+    parser.add_argument('--data-root', default='',
+                        help='optional SemanticKITTI dataset root; empty means use metadata["data_root"] in pkl')
     parser.add_argument('--scene', default='',
                         help='scene key to visualize, e.g. sequence-00; empty means all scenes')
     parser.add_argument('--max-frames', type=int, default=-1,
@@ -79,7 +81,7 @@ def parse_args():
     parser.add_argument('--save-frames', action='store_true', help='also save png frames')
     parser.add_argument('--occ-shape', type=int, nargs=3, default=[256, 256, 32],
                         metavar=('H', 'W', 'D'),
-                        help='dense occupancy shape for raw .label/.bin files; .npy/.npz will use saved shape')
+                        help='kept for compatibility; FoundationSSC .npy uses saved shape')
     parser.add_argument('--occ-dtype', default='uint16',
                         choices=['uint8', 'uint16', 'uint32', 'int32', 'int64'],
                         help='dtype for raw dense occupancy labels')
@@ -131,42 +133,44 @@ def scene_trajectory_in_current(infos, current_idx):
     return traj
 
 
-def candidate_occ_paths(info, scene_name, occ_root):
-    """根据 info 和可选 occ_root 生成若干可能的 dense occupancy 路径。"""
+def infer_data_root(data, args):
+    """最多只需提供 data-root；未提供时从 pkl metadata 中读取。"""
+    if args.data_root:
+        return osp.abspath(args.data_root)
+    metadata = data.get('metadata', {})
+    data_root = metadata.get('data_root', '')
+    if data_root:
+        return osp.abspath(data_root)
+    raise ValueError(
+        'Cannot infer data_root. Please provide --data-root or use a pkl whose '
+        'metadata contains "data_root".')
+
+
+def resolve_occ_path(info, scene_name, data_root):
+    """按 FoundationSSC 规则确定 dense occupancy 路径，不再枚举猜测。
+
+    优先级：
+      1) pkl frame_info 中的 occ_path；
+      2) pkl frame_info 中的 voxel_path；
+      3) <data_root>/labels/<sequence>/<token>_1_1.npy。
+    """
     token = info['token']
     sequence = scene_name.replace('sequence-', '')
-    candidates = []
-    for key in ['occ_path', 'voxel_path', 'label_path']:
+    for key in ['occ_path', 'voxel_path']:
         path = info.get(key, '')
-        if path:
-            candidates.append(path)
-    if occ_root:
-        candidates.extend([
-            osp.join(occ_root, f'{token}.npy'),  # occ-root直接指向 labels/00 时使用
-            osp.join(occ_root, f'{token}.npz'),
-            osp.join(occ_root, f'{token}.label'),
-            osp.join(occ_root, scene_name, f'{token}.npy'),
-            osp.join(occ_root, scene_name, f'{token}.label'),
-            osp.join(occ_root, scene_name, f'{token}.npz'),
-            osp.join(occ_root, scene_name, token, 'labels.npz'),
-            osp.join(occ_root, sequence, f'{token}.npy'),  # occ-root指向 labels 时使用 labels/00/000000.npy
-            osp.join(occ_root, sequence, f'{token}.label'),
-            osp.join(occ_root, sequence, f'{token}.npz'),
-            osp.join(occ_root, 'sequences', sequence, 'labels', f'{token}.npy'),
-            osp.join(occ_root, 'sequences', sequence, 'labels', f'{token}.label'),
-        ])
-    return candidates
+        if path and osp.isfile(path):
+            return path
+    path = osp.join(data_root, 'labels', sequence, f'{token}_1_1.npy')
+    if osp.isfile(path):
+        return path
+    raise FileNotFoundError(
+        f'FoundationSSC occupancy not found: {path}. '
+        'Expected deterministic path <data-root>/labels/<sequence>/<token>_1_1.npy.')
 
 
-def load_occupancy(info, scene_name, args):
-    """加载单帧 dense occupancy，支持 npy、npz 或展平 raw label/bin。"""
-    paths = candidate_occ_paths(info, scene_name, args.occ_root)
-    existing = [path for path in paths if path and osp.isfile(path)]
-    if not existing:
-        raise FileNotFoundError(
-            f'Cannot find occupancy for scene={scene_name}, token={info["token"]}. '
-            f'Checked candidates: {paths}')
-    path = existing[0]
+def load_occupancy(info, scene_name, data_root):
+    """加载单帧 FoundationSSC dense occupancy：<seq>/<token>_1_1.npy。"""
+    path = resolve_occ_path(info, scene_name, data_root)
     if path.endswith('.npy'):
         occ = np.load(path)
     elif path.endswith('.npz'):
@@ -178,15 +182,9 @@ def load_occupancy(info, scene_name, args):
         else:
             raise KeyError(f'{path} has no known occupancy key: {list(data.keys())}')
     else:
-        dtype = np.dtype(args.occ_dtype)
-        occ = np.fromfile(path, dtype=dtype)
-        expected = int(np.prod(args.occ_shape))
-        if occ.size != expected:
-            raise ValueError(
-                f'{path} has {occ.size} elements, but occ-shape {args.occ_shape} '
-                f'expects {expected}. This may be point-wise SemanticKITTI labels, '
-                'not dense occupancy labels.')
-        occ = occ.reshape(args.occ_shape)
+        raise ValueError(
+            f'Unsupported occupancy file extension: {path}. '
+            'FoundationSSC SemanticKITTI uses .npy dense occupancy files.')
     return occ.astype(np.int32, copy=False), path
 
 
@@ -247,7 +245,7 @@ def render_frame(occ, infos, frame_idx, scene_name, occ_path, args):
     return rgb
 
 
-def visualize_scene(scene_name, infos, args):
+def visualize_scene(scene_name, infos, args, data_root):
     """把一个 scene 的所有帧写成 BEV 视频。"""
     if args.max_frames > 0:
         infos = infos[:args.max_frames]
@@ -263,7 +261,7 @@ def visualize_scene(scene_name, infos, args):
     writer = None
     try:
         for frame_idx, info in enumerate(infos):
-            occ, occ_path = load_occupancy(info, scene_name, args)
+            occ, occ_path = load_occupancy(info, scene_name, data_root)
             rgb = render_frame(occ, infos, frame_idx, scene_name, occ_path, args)
             if writer is None:
                 height, width = rgb.shape[:2]
@@ -285,6 +283,7 @@ def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
     data = load_pkl(args.pkl)
+    data_root = infer_data_root(data, args)
     infos_by_scene = data['infos']
     if args.scene:
         if args.scene not in infos_by_scene:
@@ -293,7 +292,7 @@ def main():
     else:
         scene_names = list(infos_by_scene.keys())
     for scene_name in scene_names:
-        visualize_scene(scene_name, infos_by_scene[scene_name], args)
+        visualize_scene(scene_name, infos_by_scene[scene_name], args, data_root)
 
 
 if __name__ == '__main__':
