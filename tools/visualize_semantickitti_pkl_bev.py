@@ -143,21 +143,23 @@ def quat_wxyz_to_rotmat(q):
 
 
 def pose_matrix(info):
-    """由 pkl 中 ego2global 平移和 wxyz 四元数构造 4x4 位姿。"""
+    """由 converter 写入的 ego2global_* 字段构造 4x4 ego/LiDAR -> global 位姿。"""
     mat = np.eye(4, dtype=np.float64)
     mat[:3, :3] = quat_wxyz_to_rotmat(info['ego2global_rotation'])
     mat[:3, 3] = np.asarray(info['ego2global_translation'], dtype=np.float64)
     return mat
 
 
-def scene_trajectory_in_current(infos, current_idx):
-    """把整个 scene 的自车位置统一变换到当前帧局部坐标系，用于叠加轨迹。"""
-    poses = [pose_matrix(info) for info in infos]
-    return scene_trajectory_from_pose_cache(poses, current_idx)
-
-
 def scene_trajectory_from_pose_cache(poses, current_idx):
-    """基于已缓存的4x4位姿，把整个scene轨迹变换到当前帧局部坐标系。"""
+    """基于已缓存的4x4位姿，把整个scene轨迹变换到当前帧局部坐标系。
+
+    对应 semantickitti_converter.py 中每个 info 的：
+      - ego2global_translation
+      - ego2global_rotation
+
+    可视化时每一帧都以“当前帧自车”为原点，所以同一段全局轨迹需要
+    重新乘以 inv(T_global_current) 后再画到当前 occupancy BEV 上。
+    """
     global_to_current = np.linalg.inv(poses[current_idx])
     origin = np.asarray([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
     traj = np.stack([(global_to_current @ pose @ origin)[:2] for pose in poses])
@@ -179,6 +181,11 @@ def infer_data_root(data, args):
 
 def resolve_occ_path(info, scene_name, data_root):
     """按 FoundationSSC 规则确定 dense occupancy 路径，不再枚举猜测。
+
+    对应 semantickitti_converter.py 中每个 info 的：
+      - occ_path
+      - voxel_path
+      - token
 
     优先级：
       1) pkl frame_info 中的 occ_path；
@@ -220,7 +227,11 @@ def load_occupancy(info, scene_name, data_root):
 
 
 def occupancy_to_bev(occ, empty_labels):
-    """沿高度方向选最高有效体素类别，生成 BEV label map。"""
+    """沿高度方向选最高有效体素类别，生成 BEV label map。
+
+    converter 只负责在 info['occ_path'] 中记录 dense occupancy 路径；
+    这里才真正 np.load 读取 (H,W,D) 体素，并把高度维 D 压成一张 BEV 图。
+    """
     if occ.ndim != 3:
         raise ValueError(f'Expected occupancy shape (H,W,D), got {occ.shape}')
     empty_labels = set(empty_labels)
@@ -236,7 +247,13 @@ def occupancy_to_bev(occ, empty_labels):
 
 
 def render_frame(occ, infos, frame_idx, scene_name, occ_path, traj, args):
-    """渲染单帧 BEV occupancy + 当前局部坐标系下的自车轨迹。"""
+    """渲染单帧 BEV occupancy + 当前局部坐标系下的自车轨迹。
+
+    info字段对应关系：
+      - info['token'] / info['pose_idx']：显示在标题中，用于检查occupancy与pose是否对齐；
+      - info['occ_path']：对应 occ_path，说明当前图像来自哪个 dense occupancy 文件；
+      - info['ego2global_*']：已经在外层转换为 traj，并在当前帧局部坐标系下绘制。
+    """
     bev = occupancy_to_bev(occ, args.empty_labels)
     xmin, ymin, _, xmax, ymax, _ = args.pc_range
 
@@ -283,29 +300,54 @@ def render_frame(occ, infos, frame_idx, scene_name, occ_path, traj, args):
 
 
 def visualize_scene(scene_name, infos, args, data_root):
-    """把一个 scene 的所有帧写成 BEV 视频。"""
+    """把一个 scene 的所有帧写成 BEV 视频。
+
+    该函数和 semantickitti_converter.py 的输出结构一一对应：
+      data['infos'][scene_name] -> infos
+      infos[i]['occ_path']      -> 第i帧 dense occupancy 标签
+      infos[i]['ego2global_*']  -> 第i帧自车位姿
+      infos[i]['token']         -> SemanticKITTI帧ID，例如000110
+      infos[i]['pose_idx']      -> poses.txt真实行号，应与int(token)一致
+    """
+    #*==================== 1. 选择要可视化的连续帧 ====================#
+    # pkl中一个scene通常是 converter 保存的一段连续窗口；max_frames只截断可视化长度，
+    # 不改变pkl自身内容。
     if args.max_frames > 0:
         infos = infos[:args.max_frames]
     if not infos:
         return
+
+    #*==================== 2. 准备输出目录和视频写入器 ====================#
     scene_dir = osp.join(args.output_dir, scene_name)
     frames_dir = osp.join(scene_dir, 'frames')
     os.makedirs(scene_dir, exist_ok=True)
     if args.save_frames:
         os.makedirs(frames_dir, exist_ok=True)
     video_path = osp.join(scene_dir, 'bev.mp4')
-    #* 位姿矩阵只和pkl元数据有关，先缓存一次；避免每渲染一帧都重复解析四元数和构造矩阵。
+
+    #*==================== 3. 从info中提取并缓存整段自车位姿 ====================#
+    # converter 中写入的是 ego2global_translation / ego2global_rotation；
+    # 这里将它们转成4x4矩阵，后续每一帧可快速变换整段自车轨迹。
     poses = [pose_matrix(info) for info in infos]
     total = len(infos)
 
+    #*==================== 4. 逐帧读取occupancy、叠加轨迹并写入视频 ====================#
     writer = None
     try:
         iterator = enumerate(infos)
         for frame_idx, info in progress_iter(iterator, total=total, desc=f'Visualizing {scene_name}'):
+            #* 4.1 根据 info['occ_path'] / info['voxel_path'] / token 确定并读取 dense occupancy。
+            #* 对应 converter 中写入的 occ_path=<data-root>/labels/<seq>/<token>_1_1.npy。
             occ, occ_path = load_occupancy(info, scene_name, data_root)
-            #* 每一帧都以“当前帧自车”为原点，因此轨迹需要变换到当前帧局部坐标系。
+
+            #* 4.2 每一帧occupancy都是当前帧局部坐标系下的BEV图；
+            #* 因此整段ego轨迹也要变换到当前帧局部坐标系再叠加。
             traj = scene_trajectory_from_pose_cache(poses, frame_idx)
+
+            #* 4.3 渲染一张RGB图：BEV occupancy + history/future ego trajectory。
             rgb = render_frame(occ, infos, frame_idx, scene_name, occ_path, traj, args)
+
+            #* 4.4 首帧确定视频尺寸后初始化VideoWriter。
             if writer is None:
                 height, width = rgb.shape[:2]
                 writer = cv2.VideoWriter(
@@ -313,6 +355,8 @@ def visualize_scene(scene_name, infos, args, data_root):
                 if not writer.isOpened():
                     raise RuntimeError(f'Cannot create video: {video_path}')
             writer.write(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+
+            #* 4.5 可选保存逐帧png，便于排查某一帧的坐标/颜色/轨迹问题。
             if args.save_frames:
                 cv2.imwrite(osp.join(frames_dir, f'{frame_idx:06d}.png'),
                             cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
@@ -324,16 +368,26 @@ def visualize_scene(scene_name, infos, args, data_root):
 
 def main():
     args = parse_args()
+
+    #*==================== 1. 读取 converter 输出的 OccWorld 风格 pkl ====================#
+    # 期望结构：
+    #   data['infos']['sequence-00'] = [frame_info_0, frame_info_1, ...]
+    #   data['metadata']['data_root'] = SemanticKITTI dataset根目录
     os.makedirs(args.output_dir, exist_ok=True)
     data = load_pkl(args.pkl)
     data_root = infer_data_root(data, args)
     infos_by_scene = data['infos']
+
+    #*==================== 2. 选择要可视化的 scene ====================#
+    # converter 默认保存为 sequence-xx；例如 --sequence 00 -> scene key 为 sequence-00。
     if args.scene:
         if args.scene not in infos_by_scene:
             raise KeyError(f'{args.scene} not found in pkl. Available: {list(infos_by_scene)[:10]}')
         scene_names = [args.scene]
     else:
         scene_names = list(infos_by_scene.keys())
+
+    #*==================== 3. 逐个scene生成 BEV 视频 ====================#
     for scene_name in scene_names:
         visualize_scene(scene_name, infos_by_scene[scene_name], args, data_root)
 

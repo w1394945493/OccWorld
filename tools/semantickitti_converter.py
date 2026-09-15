@@ -245,8 +245,8 @@ def build_minimal_frame_info(
         cmd_thresh=2.0):
     """加载 SemanticKITTI 数据并构造一个真实帧的最小 OccWorld 风格 info。
 
-    #! 该函数适合单帧调试；如果要批量构造连续帧，请使用 build_window_infos。
-    #! build_window_infos 会复用 tokens/poses，避免每一帧都重复扫描目录和读取位姿。
+    #! 该函数适合单帧调试；批量构造连续帧时，main() 会先读取 tokens/poses，
+    #! 再循环调用 build_frame_info_from_cache，避免每一帧都重复扫描目录和读取位姿。
     """
     ann_file = resolve_ann_file(data_root)
     sequence_dir = osp.join(data_root, 'sequences', sequence)
@@ -281,7 +281,7 @@ def build_frame_info_from_cache(
     """基于已缓存的 tokens/poses 构造单帧 info，避免批量构建时重复 IO。
 
     #* 性能关键点：
-    #* - tokens 来自一次 os.listdir(<seq>/voxels)；
+    #* - tokens 来自一次 os.scandir(<seq>/voxels)；
     #* - poses_lidar 来自一次 calib.txt/poses.txt 读取；
     #* - 连续 N 帧只在内存中按 frame_idx 取对应元素，不再重复扫描网络盘目录。
     """
@@ -349,93 +349,6 @@ def build_frame_info_from_cache(
     return info
 
 
-def build_sequence_infos(
-        data_root,
-        sequence,
-        fut_ts,
-        his_ts,
-        cmd_thresh,
-        check_occ_files=False):
-    """为一个 sequence 的所有 FoundationSSC 帧构造最小 info 列表。"""
-    #! 只扫描一次 tokens，用于确定该 sequence 的总帧数；真正构建 info 时也会复用。
-    tokens = list_frame_tokens(osp.join(data_root, 'sequences', sequence))
-    return build_window_infos(
-        data_root=data_root,
-        sequence=sequence,
-        start_frame_idx=0,
-        num_frames=len(tokens),
-        fut_ts=fut_ts,
-        his_ts=his_ts,
-        cmd_thresh=cmd_thresh,
-        check_occ_files=check_occ_files)
-
-
-def build_window_infos(
-        data_root,
-        sequence,
-        start_frame_idx,
-        num_frames,
-        fut_ts,
-        his_ts,
-        cmd_thresh,
-        check_occ_files=False):
-    """为一个 sequence 中的连续窗口构造 info 列表。
-
-    #! 这里的“场景”不是重新切分 SemanticKITTI，而是在同一个 sequence 内截取
-    #! [start_frame_idx, start_frame_idx + num_frames) 这段连续帧保存到同一个
-    #! pkl scene key 下，方便 OccWorld 风格 dataset/可视化按时间顺序读取。
-    #! 每个 info 仍然是“单帧元数据”，列表顺序就是后续视频可视化和时序建模顺序。
-    """
-    if num_frames <= 0:
-        raise ValueError(f'num_frames must be positive, got {num_frames}')
-    ann_file = resolve_ann_file(data_root)
-    sequence_dir = osp.join(data_root, 'sequences', sequence)
-    #* 下面两步是构造连续片段时最容易变慢的文件系统操作，因此只执行一次。
-    tokens = list_frame_tokens(osp.join(data_root, 'sequences', sequence))
-    poses_lidar = load_lidar_poses(data_root, sequence)
-    token_pose_indices = [token_to_pose_index(token) for token in tokens]
-    if token_pose_indices and max(token_pose_indices) >= len(poses_lidar):
-        raise IndexError(
-            f'Max token pose index {max(token_pose_indices)} exceeds poses.txt length '
-            f'{len(poses_lidar)}. Please check sequence {sequence} tokens/poses.')
-    total_frames = min(len(tokens), len(token_pose_indices))
-    end_frame_idx = start_frame_idx + num_frames
-    if start_frame_idx < 0 or start_frame_idx >= total_frames:
-        raise IndexError(
-            f'frame_idx={start_frame_idx} out of range [0, {total_frames - 1}]')
-    if end_frame_idx > total_frames:
-        raise IndexError(
-            f'Requested window [{start_frame_idx}, {end_frame_idx}) exceeds '
-            f'sequence length {total_frames}. Please reduce --num-frames or '
-            f'use a smaller --frame-idx.')
-    print(f'Loaded sequence {sequence}: {len(tokens)} frame tokens, '
-          f'{len(poses_lidar)} poses; building window '
-          f'[{start_frame_idx}, {end_frame_idx})')
-    infos = []
-    t_start = time.time()
-    for offset, i in enumerate(range(start_frame_idx, end_frame_idx), 1):
-        infos.append(build_frame_info_from_cache(
-            data_root=data_root,
-            ann_file=ann_file,
-            sequence=sequence,
-            tokens=tokens,
-            token_pose_indices=token_pose_indices,
-            poses_lidar=poses_lidar,
-            frame_idx=i,
-            fut_ts=fut_ts,
-            his_ts=his_ts,
-            cmd_thresh=cmd_thresh,
-            check_occ_files=check_occ_files))
-        #* 连续片段通常很快；构造长sequence时每100帧刷新一次进度，避免终端看起来无响应。
-        if offset == 1 or offset == num_frames or offset % 100 == 0:
-            elapsed = time.time() - t_start
-            fps = offset / max(elapsed, 1e-6)
-            print(f'\rBuilding infos: {offset}/{num_frames} '
-                  f'({fps:.1f} frame/s)', end='', file=sys.stderr, flush=True)
-    print('', file=sys.stderr)
-    return infos
-
-
 def dump_minimal_pkl(
         infos,
         scene_name,
@@ -475,39 +388,116 @@ def print_info(info):
 
 def main():
     args = parse_args()
-    scene_name = f'sequence-{args.sequence}'
+
+    #*==================== 1. 确定数据根目录与输出scene名称 ====================#
+    # SemanticKITTI 的数据根目录为 .../dataset，内部包含 sequences/ 和 labels/。
+    # 本脚本保存成 OccWorld 风格 pkl 时，用 sequence-xx 作为 scene key。
+    data_root = args.data_root
+    sequence = args.sequence
+    scene_name = f'sequence-{sequence}'
+    sequence_dir = osp.join(data_root, 'sequences', sequence)
+
+    #*==================== 2. 确定 FoundationSSC dense occupancy 根目录 ====================#
+    # 这里不读取原始逐点 labels/*.label，而是读取 dense occupancy：
+    #   <data_root>/labels/<sequence>/<frame_id>_1_1.npy
+    ann_file = resolve_ann_file(data_root)
+
+    #*==================== 3. 读取该sequence的可用occupancy帧ID ====================#
+    # FoundationSSC 以 <data_root>/sequences/<sequence>/voxels/*.bin 来确定有哪些帧。
+    # tokens 是有序字符串列表，例如 ['000000', '000005', ..., '000110']。
+    tokens = list_frame_tokens(sequence_dir)
+
+    #*==================== 4. 读取并转换自车位姿 ====================#
+    # poses.txt 通常是 cam0->global；calib.txt 的 Tr 是 LiDAR->cam0。
+    # load_lidar_poses 会得到每个原始帧的 LiDAR/ego->global 位姿。
+    poses_lidar = load_lidar_poses(data_root, sequence)
+
+    #! 非常关键：tokens列表下标不一定等于 poses.txt 行号。
+    #! 例如第22个可用occupancy token 可能是 '000110'，其真实pose行号应为110，而不是22。
+    #! 因此后续所有位姿都通过 token_pose_indices = int(token) 对齐。
+    token_pose_indices = [token_to_pose_index(token) for token in tokens]
+    if token_pose_indices and max(token_pose_indices) >= len(poses_lidar):
+        raise IndexError(
+            f'Max token pose index {max(token_pose_indices)} exceeds poses.txt length '
+            f'{len(poses_lidar)}. Please check sequence {sequence} tokens/poses.')
+
+    #*==================== 5. 确定要保存的连续窗口 ====================#
+    # all_frames=True：保存该sequence的全部可用occupancy帧；
+    # 否则：从 --frame-idx 指定的 tokens列表下标开始，保存 --num-frames 个连续可用帧。
+    total_frames = len(tokens)
     if args.all_frames:
-        infos = build_sequence_infos(
-            data_root=args.data_root,
-            sequence=args.sequence,
-            fut_ts=args.fut_ts,
-            his_ts=args.his_ts,
-            cmd_thresh=args.cmd_thresh,
-            check_occ_files=args.check_occ_files)
-        print(f'Built {len(infos)} infos for {scene_name}')
-        print_info(infos[0])
         start_frame_idx = 0
+        end_frame_idx = total_frames
+        print(f'Build all frames for {scene_name}.')
     else:
-        infos = build_window_infos(
-            data_root=args.data_root,
-            sequence=args.sequence,
-            start_frame_idx=args.frame_idx,
-            num_frames=args.num_frames,
+        if args.num_frames <= 0:
+            raise ValueError(f'num_frames must be positive, got {args.num_frames}')
+        start_frame_idx = args.frame_idx
+        end_frame_idx = start_frame_idx + args.num_frames
+        if start_frame_idx < 0 or start_frame_idx >= total_frames:
+            raise IndexError(
+                f'frame_idx={start_frame_idx} out of range [0, {total_frames - 1}]')
+        if end_frame_idx > total_frames:
+            raise IndexError(
+                f'Requested window [{start_frame_idx}, {end_frame_idx}) exceeds '
+                f'sequence length {total_frames}. Please reduce --num-frames or '
+                f'use a smaller --frame-idx.')
+
+    num_frames_to_build = end_frame_idx - start_frame_idx
+    print(f'Loaded {scene_name}: {len(tokens)} occupancy frame tokens, '
+          f'{len(poses_lidar)} poses.')
+    print(f'Build window in token-list index: [{start_frame_idx}, {end_frame_idx}) '
+          f'({num_frames_to_build} frames).')
+
+    #*==================== 6. 逐帧构造 OccWorld 风格 frame_info ====================#
+    # 每个 info 仍然只描述一帧：
+    #   - occ_path / voxel_path 指向 dense occupancy GT；
+    #   - ego2global_translation / rotation 保存当前帧自车位姿；
+    #   - gt_ego_his_trajs / gt_ego_fut_trajs / pose_mode 构造自车运动监督；
+    #   - cams / sweeps / bbox 等目前置空，作为 LiDAR-only occupancy forecasting 最小样本。
+    infos = []
+    t_start = time.time()
+    for offset, frame_idx in enumerate(range(start_frame_idx, end_frame_idx), 1):
+        info = build_frame_info_from_cache(
+            data_root=data_root,
+            ann_file=ann_file,
+            sequence=sequence,
+            tokens=tokens,
+            token_pose_indices=token_pose_indices,
+            poses_lidar=poses_lidar,
+            frame_idx=frame_idx,
             fut_ts=args.fut_ts,
             his_ts=args.his_ts,
             cmd_thresh=args.cmd_thresh,
             check_occ_files=args.check_occ_files)
-        print(f'Built {len(infos)} consecutive infos for {scene_name}: '
-              f'[{args.frame_idx}, {args.frame_idx + args.num_frames})')
+        infos.append(info)
+
+        #* 长sequence构建时每100帧刷新一次进度，避免终端看起来无响应。
+        if offset == 1 or offset == num_frames_to_build or offset % 100 == 0:
+            elapsed = time.time() - t_start
+            fps = offset / max(elapsed, 1e-6)
+            print(f'\rBuilding infos: {offset}/{num_frames_to_build} '
+                  f'({fps:.1f} frame/s)', end='', file=sys.stderr, flush=True)
+    print('', file=sys.stderr)
+
+    print(f'Built {len(infos)} infos for {scene_name}.')
+    if infos:
         print_info(infos[0])
-        start_frame_idx = args.frame_idx
+
+    #*==================== 7. 保存为 OccWorld 风格 pkl ====================#
+    # 最终结构：
+    #   {
+    #       'infos': {'sequence-00': [frame_info_0, frame_info_1, ...]},
+    #       'metadata': {...}
+    #   }
+    # 这样 visualize_semantickitti_pkl_bev.py 可以按 scene_name 取出连续帧并合成视频。
     if args.out_pkl:
         dump_minimal_pkl(
             infos=infos,
             scene_name=scene_name,
             out_pkl=args.out_pkl,
-            data_root=args.data_root,
-            sequence=args.sequence,
+            data_root=data_root,
+            sequence=sequence,
             start_frame_idx=start_frame_idx,
             num_frames=len(infos))
         print(f'Wrote minimal pkl to: {args.out_pkl}')
