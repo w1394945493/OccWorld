@@ -306,24 +306,46 @@ class PlanUAutoRegTransformer(BaseModule):
         self.tokens_untouched = tokens_untouched
 
         #*==================== 7. 构建GPT式因果时间注意力Mask ====================#
+        #* 这个mask只作用在“时间注意力”里，用来限制每个预测query能读取哪些历史token。
+        #* PyTorch MultiheadAttention中bool mask=True表示该位置被屏蔽、不能被attention看到。
+        #* 因此这里构造的是一个上三角式mask：越靠后的输入token对越早的query不可见。
+        #* 配合forward中query使用t+1时间编码、token使用t时间编码，可以并行学习：
+        #*   query[0]看token[0]预测t1，query[1]看token[0:2]预测t2，...，
+        #*   query[F-1]看token[0:F]预测tF。
         if tokens_untouched:
+            #* tokens_untouched是较少用的分支：当每个时间步内部还拆成多个子token时，
+            #* mask列数会变成num_frames*num_tokens，保证同一帧内的多个子token整体受限。
             assert all([ch == channels[0] for ch in channels])
             for scale in range(len(channels) - 1):
-                num_tokens = self.unfold_params['kernel_size'][scale] ** 2
-                attn_mask = torch.zeros(num_frames, num_frames * num_tokens, dtype=torch.bool)
+                num_tokens = self.unfold_params['kernel_size'][scale] ** 2  # 当前尺度每个时间步包含的子token数量
+                attn_mask = torch.zeros(num_frames, num_frames * num_tokens, dtype=torch.bool)  # 行=query时间，列=所有时间的子token
                 for i_frame in range(num_frames):
+                    # conditional=True时，第i帧query只能看第i帧及以前的token；
+                    # 从下一帧的第一个子token开始全部置True，即禁止读取未来。
                     start = i_frame * num_tokens + num_tokens if conditional else i_frame * num_tokens
-                    attn_mask[i_frame, start:] = True
-                self.register_buffer(f'attn_mask_{scale}', attn_mask, False)
+                    attn_mask[i_frame, start:] = True  # True=屏蔽未来token
+                self.register_buffer(f'attn_mask_{scale}', attn_mask, False)  # 注册为buffer，随模型迁移device但不作为参数训练
         else:
-            # 默认num_tokens=1时mask形状为(F,F)：第t个query只能读取不晚于t的输入，
-            # conditional=True又令query时间位置整体后移一格，从而学习历史->下一帧预测。
-            attn_mask = torch.zeros(num_frames * num_tokens, num_frames * num_tokens, dtype=torch.bool)
+            #* 默认分支：num_tokens=1时mask形状为(F,F)，第i行对应第i个query，第j列对应第j个输入token。
+            #* conditional=True表示“条件预测下一帧”：第i个query负责预测t(i+1)，但只能读到t0~ti。
+            #* 如果conditional=False，则query和token不做下一帧错位，mask会允许读到当前位置本身。
+            attn_mask = torch.zeros(num_frames * num_tokens, num_frames * num_tokens, dtype=torch.bool)  # 初始全False，表示默认都可见
             for i_frame in range(num_frames):
-                start1 = i_frame * num_tokens
-                start2 = start1 + num_tokens if conditional else start1
-                attn_mask[start1: (start1 + num_tokens), start2:] = True
-            self.register_buffer('attn_mask', attn_mask, False)
+                start1 = i_frame * num_tokens  # 当前query所在行的起点；默认num_tokens=1时就是i_frame
+                start2 = start1 + num_tokens if conditional else start1  # conditional=True时，从下一时间步开始屏蔽
+                attn_mask[start1: (start1 + num_tokens), start2:] = True  # 当前query禁止看start2及其之后的未来token
+            self.register_buffer('attn_mask', attn_mask, False)  # 后续forward中作为attn_mask传给时间MultiheadAttention
+        # * 注：attn_mask 的 shape 对应的是 Q 的序列长度和 K/V 的序列长度，不对应 batch 维，也不对应 channel 维。对 nn.MultiheadAttention(batch_first=True) 来说：
+        # * Q: (B_attn, L_q, C)
+        # * K: (B_attn, L_k, C)
+        # * V: (B_attn, L_k, C)
+        # * attn_mask: (L_q, L_k)
+
+        # * B_attn: attention 的 batch 数
+        # * L_q: query 序列长度
+        # * L_k: key/value 序列长度
+        # * C: 特征维度4
+
 
     def forward(self, tokens, pose_tokens):
         #*==================== 并行训练前向：已知整段历史，预测各时刻下一帧 ====================#
@@ -363,14 +385,40 @@ class PlanUAutoRegTransformer(BaseModule):
         encoder_outs_pose_queries = []
 
         for temporal_attn, encoder, down, pose_attn_en, pose_en in zip(self.temporal_attentions_en, self.encoders, self.downsamples, self.pose_attn_en, self.pose_en):
+            #*==================== 编码侧三类交互 ====================#
+            #* 时间建模：固定BEV位置跨时间做因果attention，学习该位置的状态如何从t0演化到tF。
+            #* 空间建模：同一时间帧内用2D卷积/U-Net聚合相邻BEV位置，而不是做全局时空attention。
+            #* 自车交互：pose query通过spatial_attn读取同帧scene query，使自车预测感知场景布局。
             b, f, h, w, c = tokens.shape
 
             for pose_temporal_attn, pose_temporal_norm, spatial_attn, spatial_norm, ffn, ffn_norm in pose_attn_en:
+                # *======================================================================#
+                #* Pose因果时间注意力：
+                #*   Q = pose_queries: (B,F,C)，每个时间位置的“下一时刻自车运动”预测槽；
+                #*   K = pose_tokens : (B,F,C)，已知/可用的自车运动历史上下文；
+                #*   V = pose_tokens : (B,F,C)，被注意力加权汇聚的自车运动特征。
+                #* self.attn_mask默认为(F,F) bool矩阵，True表示该query-key位置被屏蔽：
+                #*   第0行: [False, True,  True,  ...]，query0只能看token0，用于预测t1；
+                #*   第1行: [False, False, True,  ...]，query1只能看token0~1，用于预测t2；
+                #*   ...
+                #* MultiheadAttention会在softmax前把mask=True的位置置为-inf，使其注意力权重变为0。
+                #* 因此这里只更新pose_queries，且不会让任一预测槽读取未来pose token。
                 pose_queries = pose_queries + pose_temporal_attn(pose_queries, pose_tokens, pose_tokens, need_weights=False, attn_mask=self.attn_mask)[0]
+
                 pose_queries = pose_temporal_norm(pose_queries)
                 #b, f, h, w, c = queries.shape
                 pose_queries = rearrange(pose_queries, 'b f c -> (b f) 1 c')
                 queries = rearrange(queries, 'b f h w c -> (b f) (h w) c')
+                # *======================================================================#
+                #* Pose-Scene同帧空间注意力：
+                #*   Q = pose_queries: (B*F,1,C)，每个样本每一帧只有1个自车预测query；
+                #*   K = queries     : (B*F,H*W,C)，同一帧内所有BEV位置的场景预测query；
+                #*   V = queries     : (B*F,H*W,C)，被自车query加权汇聚的场景特征。
+                #* 上面rearrange已经把(B,F)合并成B*F，所以每个时间帧被当成独立样本处理；
+                #* attention只在“同一帧的1个自车query”和“同一帧H*W个场景query”之间发生，
+                #* 不会从t0跳到t1/t2读取信息，因此不需要因果时间mask，attn_mask=None。
+                #* 该步只更新pose_queries，让自车运动预测感知道路结构、障碍物和占用布局；
+                #* scene queries在这里作为K/V被读取，本身不会被这次spatial_attn更新。
                 pose_queries = pose_queries + spatial_attn(pose_queries, queries, queries, need_weights=False, attn_mask=None)[0]
                 pose_queries = spatial_norm(pose_queries)
 
@@ -388,6 +436,16 @@ class PlanUAutoRegTransformer(BaseModule):
             tokens = rearrange(tokens, 'b f h w c -> (b h w) f c')
             #queries = rearrange(queries, 'b f h w c -> (b h w) f c')
             for cross_attn, cross_norm, ffn, ffn_norm in temporal_attn:
+                # *======================================================================#
+                #* Scene因果时间注意力：
+                #*   Q = queries: (B*H*W,F,C)，每个固定BEV位置上F个“下一帧场景token”预测槽；
+                #*   K = tokens : (B*H*W,F,C)，同一BEV位置的已知/可用场景token时间序列；
+                #*   V = tokens : (B*H*W,F,C)，被加权汇聚的历史场景token特征。
+                #* rearrange后，原来的每个空间格子(x,y)都被单独拿出来建模时间演化：
+                #*   第一个序列是位置(x0,y0)上的t0~t(F-1)，第二个序列是位置(x1,y0)上的t0~t(F-1)，依此类推。
+                #* self.attn_mask为(F,F)：query[k]只能读取token[0:k]，不能读取token[k+1:]。
+                #* 配合query使用t+1时间编码，query[0]预测t1，query[1]预测t2，...，query[F-1]预测tF。
+                #* 该步只更新queries；tokens作为K/V提供历史场景条件，不在这次attention中被更新。
                 queries = queries + cross_attn(queries, tokens, tokens, need_weights=False, attn_mask=self.attn_mask)[0]
                 queries = cross_norm(queries)
 
@@ -396,10 +454,17 @@ class PlanUAutoRegTransformer(BaseModule):
 
             queries = rearrange(queries, '(b h w) f c -> (b f) c h w', b=b, h=h, w=w)
             tokens = rearrange(tokens, '(b h w) f c -> (b f) c h w', b=b, h=h, w=w)
+            # *======================================================================#
+            #* 同帧空间建模：时间attention只让“同一BEV位置”的不同时刻交互；
+            #* 这里恢复为2D BEV特征图(B*F,C,H,W)，再用encoder卷积块聚合相邻网格位置。
+            #* 因此空间关系由2D卷积/U-Net建模，时间关系由上面的因果attention建模。
+            #* queries和tokens使用同一encoder变换，保证后续Q和K/V处于相同尺度的特征空间。
             queries = encoder(queries)
             tokens = encoder(tokens)
+            #* 保存当前尺度特征，解码侧通过skip connection融合高分辨率局部空间细节。
             encoder_outs_tokens.append(tokens)
             encoder_outs_queries.append(queries)
+            #* 下采样进入更粗尺度，扩大空间感受野，并降低后续多尺度建模的计算量。
             queries = down(queries)
             tokens = down(tokens)
             queries = rearrange(queries, '(b f) c h w -> b f h w c', b=b, f=f)
@@ -419,6 +484,10 @@ class PlanUAutoRegTransformer(BaseModule):
                                                                         self.decoders, self.upsamples, encoder_outs_queries[::-1],
                                                                         encoder_outs_tokens[::-1], self.pose_attn_de, self.pose_de,
                                                                         encoder_outs_pose_queries[::-1], encoder_outs_pose_tokens[::-1], self.pose_up):
+            #*==================== 解码侧三类交互 ====================#
+            #* 上采样+skip融合：恢复空间分辨率，并把编码侧局部细节接回预测分支。
+            #* 时间建模：每个BEV位置再次沿时间做因果attention，保证多尺度预测的时序一致。
+            #* 空间/自车建模：decoder卷积继续聚合邻域，pose query继续读取同帧场景query。
             queries = up(queries)
             tokens = up(tokens)
 
@@ -436,6 +505,9 @@ class PlanUAutoRegTransformer(BaseModule):
             queries = rearrange(queries, '(b f) c h w -> (b h w) f c', b=b, f=f)
             tokens = rearrange(tokens, '(b f) c h w -> (b h w) f c', b=b, f=f)
             for cross_attn, cross_norm, ffn, ffn_norm in temporal_attn:
+                #* 解码侧Scene因果时间注意力：上采样并融合skip后，再沿时间更新scene queries。
+                #* 仍然是“同一BEV位置跨时间”的attention，不让不同空间位置在这里直接交互；
+                #* 不同空间位置的关系交给后面的decoder卷积块处理。
                 queries = queries + cross_attn(queries, tokens, tokens, need_weights=False, attn_mask=self.attn_mask)[0]
                 queries = cross_norm(queries)
 
@@ -451,12 +523,16 @@ class PlanUAutoRegTransformer(BaseModule):
             pose_tokens = torch.cat([pose_tokens, encoder_out_pose_tokens], dim=2)
 
             for pose_temporal_attn, pose_temporal_norm, spatial_attn, spatial_norm, ffn, ffn_norm in pose_attn_de:
+                #* 解码侧Pose因果时间注意力：融合skip后的pose_queries继续读取pose_tokens历史。
+                #* attn_mask同样禁止未来pose信息泄露，更新对象仍是pose_queries。
                 pose_queries = pose_queries + pose_temporal_attn(pose_queries, pose_tokens, pose_tokens, need_weights=False, attn_mask=self.attn_mask)[0]
                 pose_queries = pose_temporal_norm(pose_queries)
                 #b, f, h, w, c = queries.shape
                 pose_queries = rearrange(pose_queries, 'b f c -> (b f) 1 c')
                 #queries = rearrange(queries, 'b f h w c -> (b f) (h w) c')
                 queries = rearrange(queries, '(b f) c h w -> (b f) (h w) c', b=b, f=f, h=h, w=w)
+                #* 解码侧Pose-Scene空间注意力：pose_query再次读取恢复到当前尺度的scene queries。
+                #* 这是同帧空间交互，不需要因果mask；用于让最终自车预测感知场景结构。
                 pose_queries = pose_queries + spatial_attn(pose_queries, queries, queries, need_weights=False, attn_mask=None)[0]
                 pose_queries = spatial_norm(pose_queries)
 
@@ -466,6 +542,8 @@ class PlanUAutoRegTransformer(BaseModule):
                 pose_queries = rearrange(pose_queries, '(b f) 1 c -> b f c', b=b, f=f)
             pose_queries = pose_de_(pose_queries)
             pose_tokens = pose_de_(pose_tokens)
+            #* 解码侧同帧空间建模：在恢复后的BEV尺度上再次用卷积聚合相邻位置；
+            #* 它与上面的时间attention互补，形成“固定位置时间预测 + 同帧空间融合”的U-Net结构。
             queries = decoder(queries)
             tokens = decoder(tokens)
 

@@ -98,8 +98,14 @@ def main(local_rank, args):
     my_model.init_weights()
     n_parameters = sum(p.numel() for p in my_model.parameters() if p.requires_grad)
     logger.info(f'Number of params: {n_parameters}')
+    #*==================== 根据配置冻结指定子模块 ====================#
+    # freeze_dict以“模型子模块名: 是否冻结”的形式配置，例如vae=True表示冻结my_model.vae，
+    # transformer=False表示保持my_model.transformer可训练；未配置freeze_dict时默认不冻结任何模块。
     if cfg.get('freeze_dict', False):
-        logger.info(f'Freezing model according to freeze_dict:{cfg.freeze_dict}')
+        logger.info(f'Freezing model according to freeze_dict:{cfg.freeze_dict}')  # 将实际冻结配置写入训练日志
+        # freeze_model通过getattr(my_model, key)找到对应子模块，并将True项的所有参数
+        # requires_grad设为False；False项不作处理。这里只禁止参数更新，不会自动调用模块.eval()，
+        # 因此后续my_model.train()仍会让冻结模块进入训练模式，BatchNorm统计量等仍可能发生变化。
         freeze_model(my_model, cfg.freeze_dict)
     n_parameters = sum(p.numel() for p in my_model.parameters() if p.requires_grad)
     logger.info(f'Number of params after freezed: {n_parameters}')

@@ -100,37 +100,55 @@ class TransVQVAE(BaseModule):
 
 
     def forward_train_with_plan(self, x, metas):
-        assert hasattr(self.vae, 'vqvae')
-        assert hasattr(self, 'pose_encoder')
-        bs, F, H, W, D = x.shape
-        assert F == self.num_frames + self.offset
-        output_dict = {}
-        z, shape = self.vae.forward_encoder(x) # (16 128 50 50) 训练完整occworld时，这部分无梯度
-        z = self.vae.vqvae.quant_conv(z) # (16 128 50 50)
-        z_q, loss, (perplexity, min_encodings, min_encoding_indices) = self.vae.vqvae.forward_quantizer(z, is_voxel=False) # (16 128 50 50)
-        min_encoding_indices = rearrange(min_encoding_indices, '(b f) h w -> b f h w', b=bs) # (1  16 50 50)
-        output_dict['ce_labels'] = min_encoding_indices[:, self.offset:].detach().flatten(0,1)
-        z_q = rearrange(z_q, '(b f) c h w -> b f c h w', b=bs) # (1 16 128 50 50)
+        #*==================== 1. 检查第二阶段训练输入 ====================#
+        assert hasattr(self.vae, 'vqvae')  # 第二阶段必须加载第一阶段训练得到的VQ-VAE场景Tokenizer
+        assert hasattr(self, 'pose_encoder')  # with_plan模式必须具备自车位移/驾驶模式编码器
+        bs, F, H, W, D = x.shape  # x：(B,F,H,W,D)，一批连续多帧3D语义Occupancy
+        assert F == self.num_frames + self.offset  # 默认F=16、num_frames=15、offset=1
+        output_dict = {}  # 保存场景Token监督、自车轨迹预测及其GT元数据
+
+        #*==================== 2. VQ-VAE将每帧Occupancy转换为离散Scene Token ====================#
+        # 输入F帧全部编码，是因为前num_frames帧作为Transformer输入，后移offset帧的Token编号作为GT。
+        # VQ-VAE是否参与反向传播由外部冻结设置决定；本函数本身没有torch.no_grad()或detach()冻结它。
+        z, shape = self.vae.forward_encoder(x)  # 连续特征：(B*F,C,H/d,W/d)，默认(B*16,128,50,50)
+        z = self.vae.vqvae.quant_conv(z)  # 1x1卷积投影到码字维度，空间尺寸保持不变
+        z_q, loss, (perplexity, min_encodings, min_encoding_indices) = \
+            self.vae.vqvae.forward_quantizer(z, is_voxel=False)  # 最近邻量化：返回码字向量z_q及离散码字编号
+        min_encoding_indices = rearrange(
+            min_encoding_indices, '(b f) h w -> b f h w', b=bs)  # (B*F,h,w)->(B,F,h,w)
+
+        #* offset=1时去掉t0标签，以真实[t1,...,t15]监督由[t0,...,t14]预测的下一帧Token。
+        # detach避免Token编号进入梯度图；flatten把batch和时间合并，以匹配后面的CE logits。
+        output_dict['ce_labels'] = min_encoding_indices[:, self.offset:].detach().flatten(0, 1)  # (B*num_frames,h,w)
+        z_q = rearrange(z_q, '(b f) c h w -> b f c h w', b=bs)  # 恢复时间维：(B,F,C,h,w)
+
+        # give_hiddens相关变量是早期接口遗留；当前with_plan调用没有把hidden传给self.transformer。
         hidden = None
         if self.give_hiddens:
-            hidden = z_q[:, :self.offset]
+            hidden = z_q[:, :self.offset]  # 保留最前offset帧码字，但当前函数后续未使用该变量
 
+        #*==================== 3. 将真实自车运动编码为Pose Token ====================#
+        # metas中每帧包含二维自车运动(dx,dy)和三分类驾驶指令；_get_pose_feature将二者拼成5维，
+        # 再经pose_encoder得到(B,num_frames,C)的真实Pose Token，同时整理错开offset帧的轨迹GT。
+        rel_poses, output_metas = self._get_pose_feature(metas, F-self.offset)
 
-        rel_poses, output_metas = self._get_pose_feature(metas, F-self.offset) # real_poses:(1 15 128) 自车位移(2)+自车指令(3) -> 编码为128维token
+        #*==================== 4. 并行预测下一帧场景与自车运动 ====================#
+        # Transformer输入真实t0~t14的Scene/Pose Token，并利用错位Query和因果mask一次性预测t1~t15。
+        # 这是teacher-forcing训练：各时间步使用真实历史，不把本次预测回灌；自回归回灌只在评估函数中执行。
+        z_q_predict, rel_poses = self.transformer(
+            z_q[:, :self.num_frames], pose_tokens=rel_poses)  # 场景logits及预测Pose特征
 
-        z_q_predict, rel_poses = self.transformer(z_q[:, :self.num_frames], pose_tokens=rel_poses)
+        # Pose Decoder把每个预测Pose特征解码为右转/左转/直行3种候选二维位移。
+        pose_decoded = self.pose_decoder(rel_poses)  # (B,num_frames,3,2)
+        output_dict['pose_decoded'] = pose_decoded  # 供自车轨迹规划损失使用
+        output_dict['output_metas'] = output_metas  # 保存对应t1~t15的GT位移和驾驶模式
 
-        pose_decoded = self.pose_decoder(rel_poses)
-        output_dict['pose_decoded'] = pose_decoded
-        output_dict['output_metas'] = output_metas
-
-
-        z_q_predict = z_q_predict.flatten(0, 1)
-        output_dict['ce_inputs'] = z_q_predict
-        # z: bs*f, c, h, w
-
-        # z: bs*f, h, w
+        #*==================== 5. 整理场景Token交叉熵输入 ====================#
+        # z_q_predict：(B,num_frames,N_code,h,w)，合并B和时间维后与ce_labels逐位置计算交叉熵。
+        z_q_predict = z_q_predict.flatten(0, 1)  # (B*num_frames,N_code,h,w)
+        output_dict['ce_inputs'] = z_q_predict  # 场景Token分类logits；训练阶段无需解码完整Occupancy
         return output_dict
+
     def forward_inference_with_plan(self, x, metas):
         bs, F, H, W, D = x.shape
         output_dict = {}
