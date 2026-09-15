@@ -1,8 +1,8 @@
 eval_with_pose = True
 start_frame = 0
 
-mid_frame = 5
-end_frame = 11
+mid_frame = 5  # * 历史输出t0-t4共5帧
+end_frame = 11 # * 自回归预测t5-t10 约3s
 
 
 plan_return_last = True

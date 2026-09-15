@@ -186,6 +186,10 @@ def main(local_rank, args):
     label_name = get_nuScenes_label_name(cfg.label_mapping)
     unique_label = np.asarray(cfg.unique_label)
     unique_label_str = [label_name[l] for l in unique_label]
+    #*==================== Occupancy多步预测指标统计器 ====================#
+    #* multi_step_MeanIou会按未来每个预测时间步分别维护混淆矩阵，而不是把所有未来帧混在一起统计。
+    #* sem统计语义mIoU；vox先把语义occupancy转成二值占用/空闲，再统计占用IoU。
+    #* times=eval_length表示评估未来eval_length个预测帧，最终_after_epoch()返回长度为eval_length的指标列表。
     CalMeanIou_sem = multi_step_MeanIou(unique_label, cfg.get('ignore_label', -100), unique_label_str, 'sem', times=cfg.get('eval_length'))
     CalMeanIou_vox = multi_step_MeanIou([1], cfg.get('ignore_label', -100), ['occupied'], 'vox', times=cfg.get('eval_length'))
 
@@ -194,32 +198,41 @@ def main(local_rank, args):
     val_loss_list = []
     CalMeanIou_sem.reset()
     CalMeanIou_vox.reset()
+    #*==================== ST-P3风格规划指标累加器 ====================#
+    #* autoreg_for_stp3_metric内部会在约1s/2s/3s三个时间点分别计算：
+    #*   plan_L2：预测自车轨迹与GT自车轨迹的L2误差；
+    #*   plan_obj_col：基于栅格/占用的碰撞率；
+    #*   plan_obj_box_col：基于3D bbox投影的碰撞率。
+    #* 非single版本表示从当前时刻t0累计到对应时间点的区间指标：
+    #*   1s = 0~1s，2s = 0~2s，3s = 0~3s，而不是1~2s、2~3s这种分段指标。
+    #* *_single是对应时间点的单点指标：只看约1s/2s/3s那一帧，不看此前整段轨迹。
+    #* 后面会先对验证集样本求平均，再对1s/2s/3s求总平均。
     metric_stp3 = {
-            'plan_L2_1s':0,
-            'plan_L2_2s':0,
-            'plan_L2_3s':0,
-            'plan_obj_col_1s':0,
-            'plan_obj_col_2s':0,
-            'plan_obj_col_3s':0,
-            'plan_obj_box_col_1s':0,
-            'plan_obj_box_col_2s':0,
-            'plan_obj_box_col_3s':0,
-            'plan_L2_1s_single':0,
-            'plan_L2_2s_single':0,
-            'plan_L2_3s_single':0,
-            'plan_obj_col_1s_single':0,
-            'plan_obj_col_2s_single':0,
-            'plan_obj_col_3s_single':0,
-            'plan_obj_box_col_1s_single':0,
-            'plan_obj_box_col_2s_single':0,
-            'plan_obj_box_col_3s_single':0,
+            'plan_L2_1s':0,  # 0~1s整段自车轨迹L2误差，后续累加所有验证样本后取平均
+            'plan_L2_2s':0,  # 0~2s整段自车轨迹L2误差
+            'plan_L2_3s':0,  # 0~3s整段自车轨迹L2误差
+            'plan_obj_col_1s':0,  # 0~1s整段轨迹基于occupancy栅格的碰撞率/碰撞指标
+            'plan_obj_col_2s':0,  # 0~2s整段轨迹基于occupancy栅格的碰撞率/碰撞指标
+            'plan_obj_col_3s':0,  # 0~3s整段轨迹基于occupancy栅格的碰撞率/碰撞指标
+            'plan_obj_box_col_1s':0,  # 0~1s整段轨迹基于GT 3D bbox的碰撞率/碰撞指标
+            'plan_obj_box_col_2s':0,  # 0~2s整段轨迹基于GT 3D bbox的碰撞率/碰撞指标
+            'plan_obj_box_col_3s':0,  # 0~3s整段轨迹基于GT 3D bbox的碰撞率/碰撞指标
+            'plan_L2_1s_single':0,  # 只看约1s单个时刻的L2误差，不累计0~1s整段
+            'plan_L2_2s_single':0,  # 只看约2s单个时刻的L2误差，不累计0~2s整段
+            'plan_L2_3s_single':0,  # 只看约3s单个时刻的L2误差，不累计0~3s整段
+            'plan_obj_col_1s_single':0,  # 只看约1s单个时刻的occupancy碰撞指标
+            'plan_obj_col_2s_single':0,  # 只看约2s单个时刻的occupancy碰撞指标
+            'plan_obj_col_3s_single':0,  # 只看约3s单个时刻的occupancy碰撞指标
+            'plan_obj_box_col_1s_single':0,  # 只看约1s单个时刻的bbox碰撞指标
+            'plan_obj_box_col_2s_single':0,  # 只看约2s单个时刻的bbox碰撞指标
+            'plan_obj_box_col_3s_single':0,  # 只看约3s单个时刻的bbox碰撞指标
     }
     time_used = {
-        'encode':0,
-        'mid':0,
-        'autoreg':0,
-        'total':0,
-        'per_frame':0,
+        'encode':0,  # VQ-VAE Encoder/量化等前处理耗时累计
+        'mid':0,  # 自回归开始前，中间元数据处理/pose编码等耗时累计
+        'autoreg':0,  # 逐帧自回归预测未来场景和自车运动的耗时累计
+        'total':0,  # 单个batch完整推理流程总耗时累计
+        'per_frame':0,  # 折算到每个预测帧的平均耗时累计，用于估算FPS
     }
     with torch.no_grad():
         plan_loss = 0
@@ -230,7 +243,10 @@ def main(local_rank, args):
             data_time_e = time.time()
             if cfg.get('eval_with_pose', False):
                 # *==================================================#
-                # * 推理：
+                #* 自回归推理：以历史帧为条件逐步生成未来场景和自车轨迹。
+                #* 输出中同时包含：
+                #*   sem_pred / iou_pred：未来每个时间步的occupancy预测，用于逐时间步IoU/mIoU；
+                #*   metric_stp3：1s/2s/3s处的规划L2与碰撞指标。
                 if not distributed:
                     result_dict = my_model.autoreg_for_stp3_metric(
                         x=input_occs, metas=metas,
@@ -245,6 +261,7 @@ def main(local_rank, args):
                         end_frame=cfg.get('end_frame', 12))
             else:
                 raise NotImplementedError
+
             for key in metric_stp3.keys():
                 metric_stp3[key] += result_dict['metric_stp3'][key]
             for key in time_used.keys():
@@ -264,9 +281,12 @@ def main(local_rank, args):
             if result_dict.get('target_occs', None) is not None:
                 target_occs = result_dict['target_occs']
             target_occs_iou = deepcopy(target_occs)
+            #* 二值占用IoU只关心“是否被占用”：nuScenes/Occ3D中17通常表示free，其余语义类视为occupied。
             target_occs_iou[target_occs_iou != 17] = 1
             target_occs_iou[target_occs_iou == 17] = 0
-
+            #* ===========================================================#
+            #* Occupancy评估：_after_step不会立刻汇总成一个数，而是按未来时间维逐帧累加统计量。
+            #* 因此最终val_iou[k] / val_miou[k]分别表示第k个未来预测帧的IoU / mIoU。
             CalMeanIou_sem._after_step(result_dict['sem_pred'], target_occs)
             CalMeanIou_vox._after_step(result_dict['iou_pred'], target_occs_iou)
             val_loss_list.append(loss.detach().cpu().numpy())
@@ -278,6 +298,9 @@ def main(local_rank, args):
                     detailed_loss.append(f'{loss_name}: {loss_value:.5f}')
                 detailed_loss = ', '.join(detailed_loss)
                 logger.info(detailed_loss)
+
+    #* ===========================================================#
+    #* 规划指标先对整个验证集求平均，得到1s/2s/3s三个时间点各自的平均L2/碰撞指标。
     metric_stp3 = {key:metric_stp3[key]/len(val_dataset_loader) for key in metric_stp3.keys()}
     time_used = {key:time_used[key]/len(val_dataset_loader) for key in time_used.keys()}
     # reduce for distributed
@@ -293,6 +316,9 @@ def main(local_rank, args):
         for key in time_used.keys():
             dist.all_reduce(time_used[key])
             time_used[key] /= world_size
+
+    #* ===========================================================#
+    #* 正式汇总规划指标时，再把1s、2s、3s三个时间点等权平均，得到整体规划分数。
     metric_stp3.update(avg_l2=(metric_stp3['plan_L2_1s']+metric_stp3['plan_L2_2s']+metric_stp3['plan_L2_3s'])/3)
     metric_stp3.update(avg_obj_col=(metric_stp3['plan_obj_col_1s']+metric_stp3['plan_obj_col_2s']+metric_stp3['plan_obj_col_3s'])/3)
     metric_stp3.update(avg_obj_box_col=(metric_stp3['plan_obj_box_col_1s']+metric_stp3['plan_obj_box_col_2s']+metric_stp3['plan_obj_box_col_3s'])/3)
@@ -306,6 +332,8 @@ def main(local_rank, args):
     logger.info(f'time_used is {time_used}')
     logger.info(f'FPS is {1/time_used["per_frame"]}')
 
+    #* ===========================================================#
+    #* Occupancy指标在这里完成跨验证集汇总；返回list中每一项对应一个未来预测时间步。
     val_miou, _ = CalMeanIou_sem._after_epoch()
     val_iou, _ = CalMeanIou_vox._after_epoch()
     logger.info(f'PlanRegLoss is {plan_loss/len(val_dataset_loader)}')
@@ -316,6 +344,9 @@ def main(local_rank, args):
 
     logger.info(f'Current val iou is {val_iou}')
     logger.info(f'Current val miou is {val_miou}')
+    #* ===========================================================#
+    #* OccWorld/ST-P3评估通常关注约1s、2s、3s三个预测时刻。
+    #* nuScenes关键帧间隔约0.5s，因此未来帧索引1/3/5分别近似对应1s/2s/3s。
     logger.info(f'avg val iou is {(val_iou[1]+val_iou[3]+val_iou[5])/3}')
     logger.info(f'avg val miou is {(val_miou[1]+val_miou[3]+val_miou[5])/3}')
     #logger.info(f'Current val iou is {val_iou} while the best val iou is {best_val_iou}')

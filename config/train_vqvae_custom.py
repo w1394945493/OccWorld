@@ -2,7 +2,7 @@ grad_max_norm = 35
 print_freq = 10  # 每训练10个iteration打印一次loss、学习率、梯度范数和耗时等日志（第0步也会打印）
 max_epochs = 200  # 最大训练轮数；train.py会完整遍历训练集200次
 warmup_iters = 200  # 学习率预热步数；前200个优化iteration内从warmup_lr_init逐渐升至基础学习率
-return_len_ = 10  # 每个数据样本包含的连续Occupancy帧数；表示时序长度F，不是batch size
+return_len_ = 10  # 每个数据样本包含的连续Occupancy帧数；表示时序长度F，不是batch size # * 一阶段训练return_len_=10, offset = 0: 每个batch sample取连续10帧occupancy
 
 batch_size = 2  # 每张GPU每个iteration加载的时序样本数；多卡全局BS=batch_size×GPU数
 num_workers = 2  # 每个DataLoader进程使用的数据读取子进程数；训练集和验证集共用该配置

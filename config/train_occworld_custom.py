@@ -3,7 +3,7 @@ print_freq = 10
 max_epochs = 200
 warmup_iters = 50
 return_len_ = 15
-return_len_train = 15
+return_len_train = 15 # # *  二阶段训练return_len = return_len_train + 1 = 16 每个batch_sample取连续16帧，第16帧不是历史输入，作为GT监督
 
 batch_size = 2  # 每张GPU每个iteration加载的时序样本数；多卡全局BS=batch_size×GPU数
 num_workers = 2  # 每个DataLoader进程使用的数据读取子进程数；训练集和验证集共用该配置
@@ -64,12 +64,12 @@ val_dataset_config = dict(
 
 train_wrapper_config = dict(
     type='tpvformer_dataset_nuscenes',
-    phase='train', 
+    phase='train',
 )
 
 val_wrapper_config = dict(
     type='tpvformer_dataset_nuscenes',
-    phase='val', 
+    phase='val',
 )
 
 train_loader = dict(
@@ -125,43 +125,43 @@ model = dict(
         type = 'VAERes2D',
         encoder_cfg=dict(
             type='Encoder2D',
-            ch = base_channel, 
-            out_ch = base_channel, 
-            ch_mult = (1,2,4), 
+            ch = base_channel,
+            out_ch = base_channel,
+            ch_mult = (1,2,4),
             num_res_blocks = 2,
-            attn_resolutions = (50,), 
-            dropout = 0.0, 
-            resamp_with_conv = True, 
+            attn_resolutions = (50,),
+            dropout = 0.0,
+            resamp_with_conv = True,
             in_channels = _dim_ * expansion,
-            resolution = 200, 
-            z_channels = base_channel * 2, 
+            resolution = 200,
+            z_channels = base_channel * 2,
             double_z = False,
-        ), 
+        ),
         decoder_cfg=dict(
             type='Decoder2D',
-            ch = base_channel, 
-            out_ch = _dim_ * expansion, 
-            ch_mult = (1,2,4), 
+            ch = base_channel,
+            out_ch = _dim_ * expansion,
+            ch_mult = (1,2,4),
             num_res_blocks = 2,
-            attn_resolutions = (50,), 
-            dropout = 0.0, 
-            resamp_with_conv = True, 
+            attn_resolutions = (50,),
+            dropout = 0.0,
+            resamp_with_conv = True,
             in_channels = _dim_ * expansion,
-            resolution = 200, 
-            z_channels = base_channel * 2, 
+            resolution = 200,
+            z_channels = base_channel * 2,
             give_pre_end = False
         ),
         num_classes=18,
-        expansion=expansion, 
+        expansion=expansion,
         vqvae_cfg=dict(
             type='VectorQuantizer',
             sane_index_shape=True,
-            n_e = n_e_, 
-            e_dim = base_channel * 2, 
-            beta = 1., 
-            z_channels = base_channel * 2, 
+            n_e = n_e_,
+            e_dim = base_channel * 2,
+            beta = 1.,
+            z_channels = base_channel * 2,
             use_voxel=False)),
-    
+
     transformer=dict(
         type = 'PlanUAutoRegTransformer',
         num_tokens=1,
