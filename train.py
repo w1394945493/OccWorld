@@ -410,6 +410,7 @@ if __name__ == '__main__':
     args.gpus = ngpus  # 将自动检测结果传入main，用于选择单卡或DDP分支
     print(args)
 
+    # *=================================================================#
     #* 多于1张可见GPU时，每张卡启动一个main子进程；否则直接在当前进程执行main。
     if ngpus > 1:
         torch.multiprocessing.spawn(main, args=(args,), nprocs=args.gpus)

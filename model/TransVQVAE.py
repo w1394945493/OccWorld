@@ -30,7 +30,7 @@ class TransVQVAE(BaseModule):
         self.planning_metric = None
         self.without_all = without_all
     def forward(self, x, metas=None):
-        if hasattr(self, 'pose_encoder'):
+        if hasattr(self, 'pose_encoder'): # stage2 train occworld
             if self.training:
                 return self.forward_train_with_plan(x, metas)
             else:
@@ -105,18 +105,18 @@ class TransVQVAE(BaseModule):
         bs, F, H, W, D = x.shape
         assert F == self.num_frames + self.offset
         output_dict = {}
-        z, shape = self.vae.forward_encoder(x)
-        z = self.vae.vqvae.quant_conv(z)
-        z_q, loss, (perplexity, min_encodings, min_encoding_indices) = self.vae.vqvae.forward_quantizer(z, is_voxel=False)
-        min_encoding_indices = rearrange(min_encoding_indices, '(b f) h w -> b f h w', b=bs)
+        z, shape = self.vae.forward_encoder(x) # (16 128 50 50) 训练完整occworld时，这部分无梯度
+        z = self.vae.vqvae.quant_conv(z) # (16 128 50 50)
+        z_q, loss, (perplexity, min_encodings, min_encoding_indices) = self.vae.vqvae.forward_quantizer(z, is_voxel=False) # (16 128 50 50)
+        min_encoding_indices = rearrange(min_encoding_indices, '(b f) h w -> b f h w', b=bs) # (1  16 50 50)
         output_dict['ce_labels'] = min_encoding_indices[:, self.offset:].detach().flatten(0,1)
-        z_q = rearrange(z_q, '(b f) c h w -> b f c h w', b=bs)
+        z_q = rearrange(z_q, '(b f) c h w -> b f c h w', b=bs) # (1 16 128 50 50)
         hidden = None
         if self.give_hiddens:
             hidden = z_q[:, :self.offset]
 
 
-        rel_poses, output_metas = self._get_pose_feature(metas, F-self.offset)
+        rel_poses, output_metas = self._get_pose_feature(metas, F-self.offset) # real_poses:(1 15 128) 自车位移(2)+自车指令(3) -> 编码为128维token
 
         z_q_predict, rel_poses = self.transformer(z_q[:, :self.num_frames], pose_tokens=rel_poses)
 
@@ -183,13 +183,13 @@ class TransVQVAE(BaseModule):
             output_metas = []
             for meta in metas:
                 output_meta = dict()
-                output_meta['rel_poses'] = meta['rel_poses'][self.offset:]
-                output_meta['gt_mode'] = meta['gt_mode'][self.offset:]
+                output_meta['rel_poses'] = meta['rel_poses'][self.offset:] # (15 2)
+                output_meta['gt_mode'] = meta['gt_mode'][self.offset:] # (15 3) 指令
                 output_metas.append(output_meta)
 
 
-            rel_poses = np.array([meta['rel_poses'] for meta in metas])
-            gt_mode = np.array([meta['gt_mode'] for meta in metas])
+            rel_poses = np.array([meta['rel_poses'] for meta in metas]) # (1 16 2)
+            gt_mode = np.array([meta['gt_mode'] for meta in metas]) # (1 16 3)
 
 
 
@@ -203,12 +203,12 @@ class TransVQVAE(BaseModule):
                 assert F == self.num_frames + self.offset
             else:
                 assert F == self.num_frames
-                gt_mode = gt_mode[:, :-self.offset, :]
-                rel_poses = rel_poses[:, :-self.offset, :]
+                gt_mode = gt_mode[:, :-self.offset, :] # (1 15 3)
+                rel_poses = rel_poses[:, :-self.offset, :] # (1 16 2)
 
-            rel_poses = torch.cat([rel_poses, gt_mode], dim=-1)
+            rel_poses = torch.cat([rel_poses, gt_mode], dim=-1) # (1 15 5)
             #rel_poses = rearrange(rel_poses, 'b f d -> b f 1 d')
-            rel_poses = self.pose_encoder(rel_poses.float())
+            rel_poses = self.pose_encoder(rel_poses.float()) # (1 15 128)
         return rel_poses, output_metas
 
     def forward_autoreg_with_pose(self, x, metas, start_frame=0, mid_frame=6,end_frame=12):

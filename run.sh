@@ -36,7 +36,7 @@ python tools/visualize_dataset_sequence_bev.py \
 # ========================================================#
 # stage2 完整训练
 python train.py \
-  --py-config /vepfs-mlp2/c20250502/haoce/wangyushen/OccWorld/config/train_occworld_custom.py \
+  --py-config /vepfs-mlp2/c20250502/haoce/wangyushen/OccWorld/config/train_occworld_debug.py \
   --work-dir out/occworld
 
 
